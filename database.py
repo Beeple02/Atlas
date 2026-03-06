@@ -147,7 +147,12 @@ CREATE TABLE IF NOT EXISTS atlas_meta (
 
 
 async def init_db() -> None:
-    """Create all tables if they don't exist."""
+    """Create all tables if they don't exist. Auto-creates parent directory."""
+    import os
+    db_dir = os.path.dirname(DB)
+    if db_dir and not os.path.exists(db_dir):
+        os.makedirs(db_dir, exist_ok=True)
+        logger.info("Created database directory: %s", db_dir)
     async with aiosqlite.connect(DB) as db:
         await db.executescript(SCHEMA)
         await db.commit()
