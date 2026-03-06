@@ -138,6 +138,18 @@ CREATE TABLE IF NOT EXISTS api_keys (
     active      INTEGER DEFAULT 1
 );
 
+-- Per-request log for API key usage statistics
+CREATE TABLE IF NOT EXISTS request_log (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    key_id      TEXT NOT NULL,
+    endpoint    TEXT NOT NULL,
+    method      TEXT NOT NULL DEFAULT 'GET',
+    status_code INTEGER,
+    ts          TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_request_log_key ON request_log(key_id);
+CREATE INDEX IF NOT EXISTS idx_request_log_ts  ON request_log(ts);
+
 -- Atlas operational metadata (last poll times, etc.)
 CREATE TABLE IF NOT EXISTS atlas_meta (
     key     TEXT PRIMARY KEY,
@@ -424,6 +436,59 @@ async def list_api_keys() -> list[dict]:
 
 async def deactivate_api_key(key_id: str) -> None:
     await _execute("UPDATE api_keys SET active = 0 WHERE key_id = ?", (key_id,))
+
+
+async def log_request(key_id: str, endpoint: str, method: str = "GET", status_code: int = 200) -> None:
+    await _execute(
+        "INSERT INTO request_log(key_id, endpoint, method, status_code, ts) VALUES (?, ?, ?, ?, ?)",
+        (key_id, endpoint, method, status_code, _now())
+    )
+
+
+async def get_key_stats(key_id: str) -> dict:
+    """Return usage statistics for a single API key."""
+    async with aiosqlite.connect(DB) as conn:
+        conn.row_factory = aiosqlite.Row
+        # Total requests
+        cur = await conn.execute("SELECT COUNT(*) as n FROM request_log WHERE key_id = ?", (key_id,))
+        total = (await cur.fetchone())["n"]
+
+        # Requests last 24h
+        cur = await conn.execute(
+            "SELECT COUNT(*) as n FROM request_log WHERE key_id = ? AND ts >= datetime('now', '-1 day')", (key_id,))
+        last_24h = (await cur.fetchone())["n"]
+
+        # Requests last 7d
+        cur = await conn.execute(
+            "SELECT COUNT(*) as n FROM request_log WHERE key_id = ? AND ts >= datetime('now', '-7 days')", (key_id,))
+        last_7d = (await cur.fetchone())["n"]
+
+        # Top endpoints
+        cur = await conn.execute(
+            "SELECT endpoint, COUNT(*) as n FROM request_log WHERE key_id = ? GROUP BY endpoint ORDER BY n DESC LIMIT 10",
+            (key_id,))
+        top_endpoints = [dict(r) for r in await cur.fetchall()]
+
+        # Requests per day (last 14 days)
+        cur = await conn.execute(
+            "SELECT DATE(ts) as day, COUNT(*) as n FROM request_log WHERE key_id = ? AND ts >= datetime('now', '-14 days') GROUP BY day ORDER BY day",
+            (key_id,))
+        per_day = [dict(r) for r in await cur.fetchall()]
+
+        # Recent requests
+        cur = await conn.execute(
+            "SELECT endpoint, method, status_code, ts FROM request_log WHERE key_id = ? ORDER BY ts DESC LIMIT 50",
+            (key_id,))
+        recent = [dict(r) for r in await cur.fetchall()]
+
+    return {
+        "total": total,
+        "last_24h": last_24h,
+        "last_7d": last_7d,
+        "top_endpoints": top_endpoints,
+        "per_day": per_day,
+        "recent": recent,
+    }
 
 
 # ── DB stats (for /status endpoint) ──────────────────────────────────────────
