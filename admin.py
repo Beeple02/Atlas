@@ -9,8 +9,8 @@ import json
 import logging
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Query
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi import APIRouter, Query, Request, Form
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse, RedirectResponse
 
 import database as db
 import ui
@@ -164,7 +164,70 @@ def _table(rows: list[dict], max_rows: int = 500) -> str:
 
 # ── Main route ────────────────────────────────────────────────────────────────
 
-@admin_router.get("", response_class=HTMLResponse, include_in_schema=False)
+@admin_router.post("/keys/create", response_class=HTMLResponse, include_in_schema=False)
+async def create_key(tool_id: str = Form(...), tool_name: str = Form(...)):
+    from auth import create_tool_key
+    try:
+        plaintext_key = await create_tool_key(tool_id.strip(), tool_name.strip())
+    except Exception as e:
+        return HTMLResponse(content=_key_error_page(str(e)), status_code=400)
+    return HTMLResponse(content=_new_key_page(tool_id, tool_name, plaintext_key))
+
+
+@admin_router.post("/keys/revoke", include_in_schema=False)
+async def revoke_key(tool_id: str = Form(...)):
+    await db.deactivate_api_key(tool_id)
+    return RedirectResponse(url="/admin?section=api_keys", status_code=303)
+
+
+def _new_key_page(tool_id: str, tool_name: str, key: str) -> str:
+    tb = ui.topbar("Atlas", "Admin / New Key", '<a href="/admin?section=api_keys">← Back to API Keys</a>')
+    content = f"""<div id="content" style="max-width:600px">
+      <div style="border:1px solid #bbf7d0;border-radius:8px;padding:24px;background:#f0fdf4;margin-bottom:20px">
+        <p style="font-size:13px;font-weight:600;color:#15803d;margin-bottom:4px">✓ Key created for {tool_name}</p>
+        <p style="font-size:12px;color:#166534">Copy this key now — it will never be shown again.</p>
+      </div>
+      <div style="border:1px solid #e5e5e5;border-radius:8px;padding:20px">
+        <p style="font-size:11px;color:#a3a3a3;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:8px">API Key</p>
+        <div style="display:flex;align-items:center;gap:10px">
+          <code id="keyval" style="font-family:'Geist Mono',monospace;font-size:13px;background:#f5f5f5;
+            padding:10px 14px;border-radius:6px;border:1px solid #e5e5e5;flex:1;word-break:break-all">{key}</code>
+          <button onclick="navigator.clipboard.writeText('{key}');this.textContent='Copied!';setTimeout(()=>this.textContent='Copy',2000)"
+            style="font-family:inherit;font-size:12px;font-weight:500;background:#111;color:#fff;border:none;
+              border-radius:6px;padding:8px 14px;cursor:pointer;white-space:nowrap">Copy</button>
+        </div>
+        <div style="margin-top:16px;padding-top:16px;border-top:1px solid #e5e5e5">
+          <p style="font-size:12px;color:#737373;margin-bottom:6px">Use it in requests:</p>
+          <code style="font-family:'Geist Mono',monospace;font-size:12px;color:#374151">
+            X-Atlas-Key: {key}
+          </code>
+        </div>
+      </div>
+      <p style="margin-top:16px;font-size:12px;color:#a3a3a3">
+        Tool ID: <code style="font-family:'Geist Mono',monospace">{tool_id}</code>
+      </p>
+      <a href="/admin?section=api_keys" style="display:inline-block;margin-top:20px;font-size:13px;color:#111;
+        text-decoration:none;border:1px solid #e5e5e5;border-radius:6px;padding:8px 16px">
+        ← Back to API Keys
+      </a>
+    </div>"""
+    return ui.page("Atlas / New Key", tb, "", "", content)
+
+
+def _key_error_page(error: str) -> str:
+    tb = ui.topbar("Atlas", "Admin / Error", '<a href="/admin?section=api_keys">← Back</a>')
+    content = f"""<div id="content" style="max-width:600px">
+      <div style="border:1px solid #fecaca;border-radius:8px;padding:20px;background:#fef2f2">
+        <p style="font-size:13px;font-weight:600;color:#dc2626">Failed to create key</p>
+        <p style="font-size:12px;color:#991b1b;margin-top:4px">{error}</p>
+      </div>
+      <a href="/admin?section=api_keys" style="display:inline-block;margin-top:16px;font-size:13px;color:#111;
+        text-decoration:none;border:1px solid #e5e5e5;border-radius:6px;padding:8px 16px">← Back</a>
+    </div>"""
+    return ui.page("Atlas / Error", tb, "", "", content)
+
+
+
 @admin_router.get("/", response_class=HTMLResponse, include_in_schema=False)
 async def admin_panel(
     section: str = Query(default="securities"),
@@ -214,13 +277,82 @@ async def admin_panel(
 
     # Section label + table
     section_label = dict(SECTIONS).get(section, section)
-    content = f'''<div id="content">
-      <div style="margin-bottom:16px">
-        <h1 style="font-size:16px;font-weight:600;color:#111">{section_label}</h1>
-        <p style="font-size:12px;color:#a3a3a3;margin-top:2px">{len(rows):,} records</p>
-      </div>
-      {_table(rows)}
-    </div>'''
+
+    # Special UI for api_keys section
+    extra_html = ""
+    if section == "api_keys":
+        new_key_banner = ""
+        new_key = request_new_key if hasattr(locals(), "request_new_key") else None
+        extra_html = f"""
+        <div style="border:1px solid #e5e5e5;border-radius:8px;padding:20px;margin-bottom:20px;background:#fafafa">
+          <h2 style="font-size:13px;font-weight:600;margin-bottom:12px">Create New Key</h2>
+          <form method="post" action="/admin/keys/create" style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end">
+            <div>
+              <label style="font-size:11px;color:#737373;display:block;margin-bottom:4px;text-transform:uppercase;letter-spacing:0.05em">Tool ID</label>
+              <input name="tool_id" required placeholder="e.g. bloomberg_terminal"
+                style="font-family:inherit;font-size:13px;border:1px solid #d4d4d4;border-radius:6px;padding:6px 10px;width:200px;outline:none">
+            </div>
+            <div>
+              <label style="font-size:11px;color:#737373;display:block;margin-bottom:4px;text-transform:uppercase;letter-spacing:0.05em">Display Name</label>
+              <input name="tool_name" required placeholder="e.g. Bloomberg Terminal"
+                style="font-family:inherit;font-size:13px;border:1px solid #d4d4d4;border-radius:6px;padding:6px 10px;width:220px;outline:none">
+            </div>
+            <button type="submit"
+              style="font-family:inherit;font-size:13px;font-weight:500;background:#111;color:#fff;border:none;border-radius:6px;padding:7px 16px;cursor:pointer">
+              Generate Key
+            </button>
+          </form>
+        </div>"""
+
+        # Table with revoke buttons
+        if rows:
+            headers = list(rows[0].keys())
+            th = "".join(f"<th>{h}</th>" for h in headers) + "<th>Actions</th>"
+            trs = ""
+            for row in rows:
+                tds = ""
+                for h in headers:
+                    v = row.get(h)
+                    if h == "active":
+                        tds += f'<td style="font-family:inherit"><span class="badge {"green" if v else "red"}">{"Active" if v else "Revoked"}</span></td>'
+                    elif v is None:
+                        tds += '<td style="color:#d4d4d4">—</td>'
+                    else:
+                        tds += f"<td>{v}</td>"
+                # Revoke button only for active keys
+                if row.get("active"):
+                    revoke = f'''<td style="font-family:inherit">
+                      <form method="post" action="/admin/keys/revoke" style="display:inline">
+                        <input type="hidden" name="tool_id" value="{row["key_id"]}">
+                        <button type="submit" onclick="return confirm('Revoke key for {row.get("tool_name","this tool")}?')"
+                          style="font-family:inherit;font-size:11px;color:#dc2626;background:none;border:1px solid #fecaca;border-radius:4px;padding:2px 8px;cursor:pointer">
+                          Revoke
+                        </button>
+                      </form>
+                    </td>'''
+                else:
+                    revoke = "<td>—</td>"
+                trs += f"<tr>{tds}{revoke}</tr>"
+            key_table = f'<div class="tbl-wrap"><table><thead><tr>{th}</tr></thead><tbody>{trs}</tbody></table></div>'
+        else:
+            key_table = '<div class="empty-state">No API keys yet. Create one above.</div>'
+
+        content = f'''<div id="content">
+          <div style="margin-bottom:16px">
+            <h1 style="font-size:16px;font-weight:600;color:#111">{section_label}</h1>
+            <p style="font-size:12px;color:#a3a3a3;margin-top:2px">{len(rows):,} keys</p>
+          </div>
+          {extra_html}
+          {key_table}
+        </div>'''
+    else:
+        content = f'''<div id="content">
+          <div style="margin-bottom:16px">
+            <h1 style="font-size:16px;font-weight:600;color:#111">{section_label}</h1>
+            <p style="font-size:12px;color:#a3a3a3;margin-top:2px">{len(rows):,} records</p>
+          </div>
+          {_table(rows)}
+        </div>'''
 
     return HTMLResponse(content=ui.page(
         title=f"Atlas / {section_label}",
