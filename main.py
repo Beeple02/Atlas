@@ -16,6 +16,7 @@ import database as db
 import ingestion
 from api.routes import router
 from dashboard import dashboard_router
+from admin import admin_router
 from config import settings
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -79,6 +80,7 @@ app.add_middleware(
 
 app.include_router(router)
 app.include_router(dashboard_router)
+app.include_router(admin_router)
 
 
 # ── CLI key management helper ─────────────────────────────────────────────────
