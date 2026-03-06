@@ -10,7 +10,7 @@ import secrets
 import string
 from typing import Optional
 
-from fastapi import Header, HTTPException, status
+from fastapi import Header, HTTPException, Request, status
 
 import database as db
 
@@ -54,7 +54,7 @@ async def validate_key(key: str) -> Optional[dict]:
 
 # ── FastAPI dependency ────────────────────────────────────────────────────────
 
-async def require_auth(x_atlas_key: str = Header(default=None)) -> dict:
+async def require_auth(request: Request, x_atlas_key: str = Header(default=None)) -> dict:
     """
     FastAPI dependency. Inject into any route that requires authentication.
     Usage: async def my_route(auth: dict = Depends(require_auth)):
@@ -70,4 +70,14 @@ async def require_auth(x_atlas_key: str = Header(default=None)) -> dict:
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or inactive API key"
         )
+    # Log the request (fire and forget)
+    try:
+        await db.log_request(
+            key_id=record["key_id"],
+            endpoint=request.url.path,
+            method=request.method,
+            status_code=200
+        )
+    except Exception:
+        pass
     return record
