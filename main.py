@@ -42,11 +42,8 @@ async def lifespan(app: FastAPI):
     # 2. Initialize HTTP session for NER API calls
     await ingestion.init_session()
 
-    # 3. Run initial full sync
-    try:
-        await ingestion.run_initial_sync()
-    except Exception as e:
-        logger.error("Initial sync failed: %s — Atlas will retry on schedule", e)
+    # 3. Start serving immediately, run initial sync in background
+    asyncio.create_task(ingestion.run_initial_sync())
 
     # 4. Start the polling scheduler
     scheduler = ingestion.create_scheduler()
