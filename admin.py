@@ -1,6 +1,6 @@
 """
-Atlas Admin Panel — Brutalist Edition
-Raw data browser. No fluff.
+Atlas Admin Panel
+Data browser at /admin — light, minimal, clean.
 """
 
 import csv
@@ -13,44 +13,25 @@ from fastapi import APIRouter, Query
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 import database as db
+import ui
 
 logger = logging.getLogger(__name__)
 admin_router = APIRouter(prefix="/admin")
 
-
-def _now_str() -> str:
-    return datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-
-
-# ── Export helpers ────────────────────────────────────────────────────────────
-
-def _to_csv(rows: list[dict]) -> str:
-    if not rows:
-        return ""
-    buf = io.StringIO()
-    w = csv.DictWriter(buf, fieldnames=rows[0].keys())
-    w.writeheader()
-    w.writerows(rows)
-    return buf.getvalue()
+SECTIONS = [
+    ("securities",    "Securities"),
+    ("orderbook",     "Orderbook"),
+    ("price_history", "Price History"),
+    ("ohlcv",         "OHLCV"),
+    ("derived",       "Derived Metrics"),
+    ("shareholders",  "Shareholders"),
+    ("api_keys",      "API Keys"),
+    ("meta",          "Meta"),
+]
+FILTERABLE = {"orderbook", "price_history", "ohlcv", "shareholders"}
 
 
-def _to_excel(rows: list[dict], sheet_name: str = "Data") -> bytes:
-    try:
-        import openpyxl
-        wb = openpyxl.Workbook()
-        ws = wb.active
-        ws.title = sheet_name
-        if rows:
-            headers = list(rows[0].keys())
-            ws.append(headers)
-            for row in rows:
-                ws.append([row.get(h) for h in headers])
-        buf = io.BytesIO()
-        wb.save(buf)
-        return buf.getvalue()
-    except ImportError:
-        raise RuntimeError("openpyxl not installed")
-
+# ── Data fetcher ──────────────────────────────────────────────────────────────
 
 async def _get_data(section: str, ticker: str | None) -> list[dict]:
     if section == "securities":
@@ -100,6 +81,36 @@ async def _get_data(section: str, ticker: str | None) -> list[dict]:
     return []
 
 
+# ── Export ────────────────────────────────────────────────────────────────────
+
+def _to_csv(rows: list[dict]) -> str:
+    if not rows:
+        return ""
+    buf = io.StringIO()
+    w = csv.DictWriter(buf, fieldnames=rows[0].keys())
+    w.writeheader()
+    w.writerows(rows)
+    return buf.getvalue()
+
+
+def _to_excel(rows: list[dict], sheet_name: str = "Data") -> bytes:
+    try:
+        import openpyxl
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = sheet_name
+        if rows:
+            headers = list(rows[0].keys())
+            ws.append(headers)
+            for row in rows:
+                ws.append([row.get(h) for h in headers])
+        buf = io.BytesIO()
+        wb.save(buf)
+        return buf.getvalue()
+    except ImportError:
+        raise RuntimeError("openpyxl not installed")
+
+
 @admin_router.get("/export/{section}")
 async def export_data(
     section: str,
@@ -107,8 +118,8 @@ async def export_data(
     ticker: str | None = Query(default=None),
 ):
     rows = await _get_data(section, ticker)
-    fname = f"atlas_{section}_{_now_str()}"
-
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    fname = f"atlas_{section}_{ts}"
     if fmt == "json":
         return JSONResponse(content=rows, headers={
             "Content-Disposition": f"attachment; filename={fname}.json"
@@ -116,26 +127,22 @@ async def export_data(
     elif fmt == "xlsx":
         try:
             data = _to_excel(rows, sheet_name=section)
-            return StreamingResponse(
-                io.BytesIO(data),
+            return StreamingResponse(io.BytesIO(data),
                 media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                headers={"Content-Disposition": f"attachment; filename={fname}.xlsx"}
-            )
+                headers={"Content-Disposition": f"attachment; filename={fname}.xlsx"})
         except RuntimeError as e:
             return JSONResponse(status_code=500, content={"detail": str(e)})
     else:
-        return StreamingResponse(
-            io.StringIO(_to_csv(rows)),
+        return StreamingResponse(io.StringIO(_to_csv(rows)),
             media_type="text/csv",
-            headers={"Content-Disposition": f"attachment; filename={fname}.csv"}
-        )
+            headers={"Content-Disposition": f"attachment; filename={fname}.csv"})
 
 
-# ── HTML ──────────────────────────────────────────────────────────────────────
+# ── HTML helpers ──────────────────────────────────────────────────────────────
 
 def _table(rows: list[dict], max_rows: int = 500) -> str:
     if not rows:
-        return '<p class="empty">— no data —</p>'
+        return '<div class="empty-state">No data available.</div>'
     headers = list(rows[0].keys())
     truncated = len(rows) > max_rows
     th = "".join(f"<th>{h}</th>" for h in headers)
@@ -145,29 +152,17 @@ def _table(rows: list[dict], max_rows: int = 500) -> str:
         for h in headers:
             v = row.get(h)
             if v is None:
-                tds += "<td>—</td>"
+                tds += '<td style="color:#d4d4d4">—</td>'
             elif isinstance(v, (list, dict)):
-                tds += f"<td title='{json.dumps(v)}'>[…]</td>"
+                tds += f"<td title='{json.dumps(v)}'>[object]</td>"
             else:
                 tds += f"<td>{v}</td>"
         trs += f"<tr>{tds}</tr>"
-    note = f'<p class="truncnote">showing {max_rows}/{len(rows)} rows — export to see all</p>' if truncated else ""
+    note = f'<p class="trunc-note">Showing {max_rows} of {len(rows)} rows. Export to see all.</p>' if truncated else ""
     return f'<div class="tbl-wrap"><table><thead><tr>{th}</tr></thead><tbody>{trs}</tbody></table></div>{note}'
 
 
-def _ticker_sel(tickers: list[str], current: str, section: str) -> str:
-    opts = '<option value="">all</option>'
-    for t in tickers:
-        sel = "selected" if t == current else ""
-        opts += f'<option value="{t}" {sel}>{t}</option>'
-    return f'<label>ticker: <select onchange="location=\'/admin?section={section}&ticker=\'+this.value">{opts}</select></label>'
-
-
-SECTIONS = [
-    "securities", "orderbook", "price_history",
-    "ohlcv", "derived", "shareholders", "api_keys", "meta",
-]
-
+# ── Main route ────────────────────────────────────────────────────────────────
 
 @admin_router.get("", response_class=HTMLResponse, include_in_schema=False)
 @admin_router.get("/", response_class=HTMLResponse, include_in_schema=False)
@@ -178,173 +173,56 @@ async def admin_panel(
     tickers = await db.get_all_tickers()
     ner_ok = await db.get_meta("ner_reachable") != "false"
     initialized = await db.get_meta("atlas_initialized") == "true"
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
     rows = await _get_data(section, ticker or None)
 
-    nav = "".join(
-        f'<a href="/admin?section={s}" class="nav{" active" if s == section else ""}">{s}</a>'
-        for s in SECTIONS
+    # Topbar right side
+    ner_pill = f'<span class="tb-pill {"ok" if ner_ok else "err"}"><span class="dot"></span>NER</span>'
+    init_pill = f'<span class="tb-pill {"ok" if initialized else "warn"}"><span class="dot"></span>{"Ready" if initialized else "Init…"}</span>'
+    right = f'{ner_pill}{init_pill}<span>{now}</span><a href="/dashboard">Dashboard</a><a href="/docs">API Docs</a>'
+    tb = ui.topbar("Atlas", "Admin", right)
+
+    # Nav tabs
+    nav_tabs = "".join(
+        f'<a href="/admin?section={sid}" class="nav-tab{"  active" if sid == section else ""}">{label}</a>'
+        for sid, label in SECTIONS
     )
+    nav = f'<div id="nav">{nav_tabs}</div>'
 
-    filter_html = ""
-    if section in ("orderbook", "price_history", "ohlcv", "shareholders"):
-        filter_html = f'<span class="filter">{_ticker_sel(tickers, ticker, section)}</span>'
-
+    # Toolbar
     tf = f"&ticker={ticker}" if ticker else ""
-    export_html = f"""<span class="exports">export:
-      <a href="/admin/export/{section}?fmt=csv{tf}">csv</a>
-      <a href="/admin/export/{section}?fmt=json{tf}">json</a>
-      <a href="/admin/export/{section}?fmt=xlsx{tf}">xlsx</a>
-    </span>
-    <span class="rowcount">{len(rows)} rows</span>"""
+    filter_html = ""
+    if section in FILTERABLE:
+        opts = '<option value="">All tickers</option>' + "".join(
+            f'<option value="{t}"{"selected" if t == ticker else ""}>{t}</option>'
+            for t in tickers
+        )
+        filter_html = f'''<span class="tb-label">Ticker</span>
+        <select onchange="location='/admin?section={section}&ticker='+this.value">{opts}</select>'''
 
-    html = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ATLAS / {section}</title>
-<style>
-  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-  body {{
-    font-family: "Courier New", Courier, monospace;
-    font-size: 13px;
-    background: #fff;
-    color: #000;
-  }}
+    toolbar = f'''<div id="toolbar">
+      {filter_html}
+      <div class="export-group">
+        <span class="lbl">Export</span>
+        <a href="/admin/export/{section}?fmt=csv{tf}" class="btn-export">CSV</a>
+        <a href="/admin/export/{section}?fmt=json{tf}" class="btn-export">JSON</a>
+        <a href="/admin/export/{section}?fmt=xlsx{tf}" class="btn-export">Excel</a>
+      </div>
+      <span class="row-count">{len(rows):,} rows</span>
+    </div>'''
 
-  #topbar {{
-    border-bottom: 2px solid #000;
-    padding: 7px 16px;
-    display: flex;
-    align-items: baseline;
-    gap: 16px;
-    flex-wrap: wrap;
-  }}
-  #topbar .wordmark {{ font-weight: bold; letter-spacing: 4px; font-size: 14px; }}
-  #topbar .slash {{ color: #bbb; }}
-  #topbar .right {{ margin-left: auto; font-size: 11px; color: #888; display: flex; gap: 16px; align-items: baseline; }}
-  #topbar .right a {{ color: #888; text-decoration: none; }}
-  #topbar .right a:hover {{ color: #000; }}
-  .ner-down {{ text-decoration: line-through; color: #aaa; }}
+    # Section label + table
+    section_label = dict(SECTIONS).get(section, section)
+    content = f'''<div id="content">
+      <div style="margin-bottom:16px">
+        <h1 style="font-size:16px;font-weight:600;color:#111">{section_label}</h1>
+        <p style="font-size:12px;color:#a3a3a3;margin-top:2px">{len(rows):,} records</p>
+      </div>
+      {_table(rows)}
+    </div>'''
 
-  #nav {{
-    border-bottom: 1px solid #000;
-    padding: 5px 16px;
-    display: flex;
-    gap: 4px;
-    flex-wrap: wrap;
-  }}
-  a.nav {{
-    padding: 2px 10px;
-    color: #999;
-    text-decoration: none;
-    font-size: 12px;
-    border: 1px solid transparent;
-  }}
-  a.nav:hover {{ color: #000; }}
-  a.nav.active {{
-    color: #000;
-    border: 1px solid #000;
-  }}
-
-  #toolbar {{
-    border-bottom: 1px solid #ddd;
-    padding: 5px 16px;
-    display: flex;
-    align-items: center;
-    gap: 20px;
-    background: #fafafa;
-    font-size: 12px;
-    flex-wrap: wrap;
-  }}
-  .filter label {{ color: #555; }}
-  .filter select {{
-    font-family: inherit;
-    font-size: 12px;
-    border: 1px solid #000;
-    padding: 1px 4px;
-    background: #fff;
-    margin-left: 4px;
-    cursor: pointer;
-  }}
-  .exports {{ color: #888; }}
-  .exports a {{
-    color: #000;
-    font-weight: bold;
-    text-decoration: underline;
-    margin-left: 6px;
-  }}
-  .exports a:hover {{
-    background: #000;
-    color: #fff;
-    text-decoration: none;
-    padding: 1px 2px;
-  }}
-  .rowcount {{ color: #bbb; margin-left: auto; }}
-
-  #section-label {{
-    padding: 8px 16px 0;
-    font-size: 10px;
-    color: #bbb;
-    letter-spacing: 3px;
-    text-transform: uppercase;
-  }}
-
-  .tbl-wrap {{ overflow-x: auto; padding: 0 16px 32px; }}
-  table {{ border-collapse: collapse; margin-top: 8px; width: 100%; }}
-  thead tr {{ border-bottom: 2px solid #000; }}
-  th {{
-    text-align: left;
-    padding: 4px 16px 4px 0;
-    font-size: 10px;
-    text-transform: uppercase;
-    letter-spacing: 1.5px;
-    white-space: nowrap;
-  }}
-  td {{
-    padding: 3px 16px 3px 0;
-    border-bottom: 1px solid #f0f0f0;
-    white-space: nowrap;
-    max-width: 260px;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    color: #222;
-  }}
-  tr:hover td {{ background: #f7f7f7; }}
-  .empty {{ padding: 24px 16px; color: #bbb; font-size: 12px; }}
-  .truncnote {{ padding: 6px 16px; font-size: 11px; color: #bbb; }}
-</style>
-</head>
-<body>
-
-<div id="topbar">
-  <span class="wordmark">ATLAS</span>
-  <span class="slash">/</span>
-  <span>admin</span>
-  <span class="slash">/</span>
-  <span>{section}</span>
-  <div class="right">
-    <span class="{'ner-ok' if ner_ok else 'ner-down'}">NER</span>
-    <span>{'ready' if initialized else 'init...'}</span>
-    <span>{now}</span>
-    <a href="/dashboard">dashboard</a>
-    <a href="/docs">api docs</a>
-  </div>
-</div>
-
-<div id="nav">{nav}</div>
-
-<div id="toolbar">
-  {filter_html}
-  {export_html}
-</div>
-
-<div id="section-label">{section}</div>
-<div id="content">{_table(rows)}</div>
-
-</body>
-</html>"""
-
-    return HTMLResponse(content=html)
+    return HTMLResponse(content=ui.page(
+        title=f"Atlas / {section_label}",
+        topbar=tb, nav=nav, toolbar=toolbar, content=content
+    ))
