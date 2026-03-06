@@ -6,6 +6,7 @@ Starts the database, ingestion scheduler, and FastAPI server together.
 import asyncio
 import logging
 import sys
+from contextlib import asynccontextmanager
 
 import uvicorn
 from fastapi import FastAPI
@@ -26,41 +27,22 @@ logging.basicConfig(
 logger = logging.getLogger("atlas")
 
 # ── App ───────────────────────────────────────────────────────────────────────
-app = FastAPI(
-    title="Atlas",
-    description="Bloomberg Labs — Market Data Infrastructure",
-    version="1.0.0",
-    docs_url="/docs",
-    redoc_url="/redoc",
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],   # Restrict to internal network in production
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-app.include_router(router)
-app.include_router(dashboard_router)
-
 # ── Lifecycle ─────────────────────────────────────────────────────────────────
-scheduler = None
 
-
-@app.on_event("startup")
-async def startup():
-    global scheduler
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # ── Startup ──
+    scheduler = None
     logger.info("Atlas starting up...")
 
-    # 1. Initialize database
+    # 1. Initialize database (auto-creates directory if needed)
     await db.init_db()
     logger.info("Database ready")
 
     # 2. Initialize HTTP session for NER API calls
     await ingestion.init_session()
 
-    # 3. Run initial full sync (blocks until first data is loaded)
+    # 3. Run initial full sync
     try:
         await ingestion.run_initial_sync()
     except Exception as e:
@@ -70,18 +52,36 @@ async def startup():
     scheduler = ingestion.create_scheduler()
     scheduler.start()
     logger.info("Scheduler started with %d jobs", len(scheduler.get_jobs()))
-
     logger.info("Atlas is ready on port %d", settings.port)
 
+    yield  # App is running
 
-@app.on_event("shutdown")
-async def shutdown():
-    global scheduler
+    # ── Shutdown ──
     logger.info("Atlas shutting down...")
     if scheduler and scheduler.running:
         scheduler.shutdown(wait=False)
     await ingestion.close_session()
     logger.info("Atlas stopped cleanly")
+
+
+app = FastAPI(
+    title="Atlas",
+    description="Bloomberg Labs — Market Data Infrastructure",
+    version="1.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc",
+    lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.include_router(router)
+app.include_router(dashboard_router)
 
 
 # ── CLI key management helper ─────────────────────────────────────────────────
