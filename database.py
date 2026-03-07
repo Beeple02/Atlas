@@ -73,7 +73,8 @@ CREATE TABLE IF NOT EXISTS price_history (
     price       REAL NOT NULL,
     volume      INTEGER,
     timestamp   TEXT NOT NULL,
-    source      TEXT DEFAULT 'ner_api'  -- 'ner_api' | 'webhook'
+    source      TEXT DEFAULT 'ner_api',  -- 'ner_api' | 'webhook'
+    UNIQUE(ticker, timestamp, price)
 );
 CREATE INDEX IF NOT EXISTS idx_ph ON price_history(ticker, timestamp);
 
@@ -165,9 +166,34 @@ async def init_db() -> None:
     if db_dir and not os.path.exists(db_dir):
         os.makedirs(db_dir, exist_ok=True)
         logger.info("Created database directory: %s", db_dir)
-    async with aiosqlite.connect(DB) as db:
-        await db.executescript(SCHEMA)
-        await db.commit()
+    async with aiosqlite.connect(DB) as conn:
+        await conn.executescript(SCHEMA)
+        await conn.commit()
+
+        # Migration: rebuild price_history with UNIQUE constraint if not present
+        cur = await conn.execute("PRAGMA index_list(price_history)")
+        indexes = [row[1] for row in await cur.fetchall()]
+        if "sqlite_autoindex_price_history_1" not in indexes:
+            logger.info("Migrating price_history: adding UNIQUE constraint and removing duplicates...")
+            await conn.executescript("""
+                CREATE TABLE IF NOT EXISTS price_history_new (
+                    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ticker    TEXT NOT NULL,
+                    price     REAL NOT NULL,
+                    volume    INTEGER,
+                    timestamp TEXT NOT NULL,
+                    source    TEXT DEFAULT 'ner_api',
+                    UNIQUE(ticker, timestamp, price)
+                );
+                INSERT OR IGNORE INTO price_history_new(ticker, price, volume, timestamp, source)
+                    SELECT ticker, price, volume, timestamp, source FROM price_history;
+                DROP TABLE price_history;
+                ALTER TABLE price_history_new RENAME TO price_history;
+                CREATE INDEX IF NOT EXISTS idx_ph ON price_history(ticker, timestamp);
+            """)
+            await conn.commit()
+            logger.info("Migration complete: price_history deduplicated.")
+
     logger.info("Database initialized: %s", DB)
 
 
@@ -299,14 +325,35 @@ async def get_all_orderbooks() -> list[dict]:
 
 # ── Price history ─────────────────────────────────────────────────────────────
 
+def _normalize_timestamp(ts: str | None) -> str | None:
+    """Normalize any timestamp format to ISO 8601."""
+    if not ts:
+        return None
+    ts = str(ts).strip()
+    # Already ISO
+    if "T" in ts or len(ts) > 10:
+        return ts
+    # dd-mm-yy → ISO
+    try:
+        from datetime import datetime
+        for fmt in ("%d-%m-%y", "%d-%m-%Y", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(ts, fmt).strftime("%Y-%m-%dT00:00:00")
+            except ValueError:
+                continue
+    except Exception:
+        pass
+    return ts
+
+
 async def insert_price_history(ticker: str, records: list[dict], source: str = "ner_api") -> None:
-    """Insert price history, ignoring duplicates by timestamp."""
+    """Insert price history, skipping duplicates via UNIQUE(ticker, timestamp, price)."""
     if not records:
         return
     await _executemany(
         """INSERT OR IGNORE INTO price_history(ticker, price, volume, timestamp, source)
            VALUES (?, ?, ?, ?, ?)""",
-        [(ticker, r.get("price"), r.get("volume"), r.get("timestamp"), source)
+        [(ticker, r.get("price"), r.get("volume"), _normalize_timestamp(r.get("timestamp")), source)
          for r in records]
     )
 
