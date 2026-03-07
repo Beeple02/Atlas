@@ -19,16 +19,17 @@ logger = logging.getLogger(__name__)
 admin_router = APIRouter(prefix="/admin")
 
 SECTIONS = [
-    ("securities",    "Securities"),
-    ("orderbook",     "Orderbook"),
-    ("price_history", "Price History"),
-    ("ohlcv",         "OHLCV"),
-    ("derived",       "Derived Metrics"),
-    ("shareholders",  "Shareholders"),
-    ("api_keys",      "API Keys"),
-    ("meta",          "Meta"),
+    ("securities",         "Securities"),
+    ("orderbook",          "Orderbook"),
+    ("orderbook_history",  "OB History"),
+    ("price_history",      "Price History"),
+    ("ohlcv",              "OHLCV"),
+    ("derived",            "Derived Metrics"),
+    ("shareholders",       "Shareholders"),
+    ("api_keys",           "API Keys"),
+    ("meta",               "Meta"),
 ]
-FILTERABLE = {"orderbook", "price_history", "ohlcv", "shareholders"}
+FILTERABLE = {"orderbook", "orderbook_history", "price_history", "ohlcv", "shareholders"}
 
 
 # ── Data fetcher ──────────────────────────────────────────────────────────────
@@ -41,6 +42,8 @@ async def _get_data(section: str, ticker: str | None) -> list[dict]:
             ob = await db.get_orderbook(ticker.upper())
             return [ob] if ob else []
         return await db.get_all_orderbooks()
+    elif section == "orderbook_history":
+        return await db.get_orderbook_history(ticker or None, limit=1000)
     elif section == "price_history":
         if ticker:
             return await db.get_price_history(ticker.upper(), days=365, limit=5000)
@@ -228,6 +231,94 @@ def _key_error_page(error: str) -> str:
 
 
 
+@admin_router.get("/keys/{tool_id}", response_class=HTMLResponse, include_in_schema=False)
+async def key_detail(tool_id: str):
+    keys = await db.list_api_keys()
+    key_record = next((k for k in keys if k["key_id"] == tool_id), None)
+    if not key_record:
+        return HTMLResponse(content=_key_error_page(f"Key '{tool_id}' not found."), status_code=404)
+
+    stats = await db.get_key_stats(tool_id)
+    tb = ui.topbar("Atlas", f"Admin / API Keys / {tool_id}", '<a href="/admin?section=api_keys">← API Keys</a>')
+    active = key_record.get("active")
+    status_badge = f'<span class="badge {"green" if active else "red"}">{"Active" if active else "Revoked"}</span>'
+
+    stat_cards = f"""<div class="stat-grid" style="margin-bottom:24px">
+      <div class="stat-card"><div class="s-label">Status</div>
+        <div class="s-value" style="font-size:14px;margin-top:4px">{status_badge}</div></div>
+      <div class="stat-card"><div class="s-label">Total Requests</div>
+        <div class="s-value">{stats["total"]:,}</div></div>
+      <div class="stat-card"><div class="s-label">Last 24h</div>
+        <div class="s-value">{stats["last_24h"]:,}</div></div>
+      <div class="stat-card"><div class="s-label">Last 7 days</div>
+        <div class="s-value">{stats["last_7d"]:,}</div></div>
+      <div class="stat-card"><div class="s-label">Created</div>
+        <div class="s-value" style="font-size:13px">{(key_record.get("created_at") or "—")[:10]}</div></div>
+      <div class="stat-card"><div class="s-label">Last Used</div>
+        <div class="s-value" style="font-size:13px">{(key_record.get("last_used") or "never")[:16]}</div></div>
+    </div>"""
+
+    revoke_form = f"""<form method="post" action="/admin/keys/revoke"
+        style="margin-top:16px;padding-top:16px;border-top:1px solid #e5e5e5">
+      <input type="hidden" name="tool_id" value="{tool_id}">
+      <button type="submit" onclick="return confirm('Revoke this key?')"
+        style="font-family:inherit;font-size:12px;font-weight:500;color:#dc2626;background:#fff;
+          border:1px solid #fecaca;border-radius:6px;padding:6px 14px;cursor:pointer">
+        Revoke Key
+      </button>
+    </form>""" if active else ""
+
+    header_block = f"""<div style="border:1px solid #e5e5e5;border-radius:8px;padding:20px;margin-bottom:24px">
+      <p style="font-size:11px;color:#a3a3a3;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:12px">Usage</p>
+      <div style="background:#f5f5f5;border-radius:6px;padding:10px 14px;font-family:'Geist Mono',monospace;font-size:12px;color:#374151;margin-bottom:8px">
+        X-Atlas-Key: atl_{tool_id}_<span style="color:#a3a3a3">&lt;secret&gt;</span>
+      </div>
+      <p style="font-size:12px;color:#a3a3a3">The full plaintext key was shown once at creation. If lost, revoke and create a new one.</p>
+      {revoke_form}
+    </div>"""
+
+    if stats["top_endpoints"]:
+        ep_rows = "".join(
+            f"<tr><td style='font-family:inherit'>{r['endpoint']}</td><td>{r['n']:,}</td></tr>"
+            for r in stats["top_endpoints"]
+        )
+        endpoints_block = f"""<div style="border:1px solid #e5e5e5;border-radius:8px;overflow:hidden;margin-bottom:24px">
+          <div style="padding:14px 20px;border-bottom:1px solid #e5e5e5">
+            <h2 style="font-size:13px;font-weight:600">Top Endpoints</h2></div>
+          <div style="padding:0 20px 4px">
+            <table><thead><tr><th>Endpoint</th><th>Requests</th></tr></thead>
+            <tbody>{ep_rows}</tbody></table></div>
+        </div>"""
+    else:
+        endpoints_block = ""
+
+    if stats["recent"]:
+        recent_rows = "".join(
+            f"<tr><td style='font-family:inherit'>{r['method']}</td><td>{r['endpoint']}</td><td>{r['status_code']}</td><td>{r['ts'][:19]}</td></tr>"
+            for r in stats["recent"]
+        )
+        recent_block = f"""<div style="border:1px solid #e5e5e5;border-radius:8px;overflow:hidden">
+          <div style="padding:14px 20px;border-bottom:1px solid #e5e5e5">
+            <h2 style="font-size:13px;font-weight:600">Recent Requests
+              <span style="color:#a3a3a3;font-weight:400;font-size:12px">(last 50)</span></h2></div>
+          <div style="padding:0 20px 4px">
+            <table><thead><tr><th>Method</th><th>Endpoint</th><th>Status</th><th>Time</th></tr></thead>
+            <tbody>{recent_rows}</tbody></table></div>
+        </div>"""
+    else:
+        recent_block = '<div style="border:1px solid #e5e5e5;border-radius:8px;padding:32px;text-align:center;color:#a3a3a3;font-size:13px">No requests logged yet.</div>'
+
+    content = f"""<div id="content">
+      <div style="margin-bottom:20px;display:flex;align-items:baseline;gap:12px">
+        <h1 style="font-size:16px;font-weight:600">{key_record.get("tool_name", tool_id)}</h1>
+        <code style="font-size:12px;color:#a3a3a3;font-family:'Geist Mono',monospace">{tool_id}</code>
+      </div>
+      {stat_cards}{header_block}{endpoints_block}{recent_block}
+    </div>"""
+
+    return HTMLResponse(content=ui.page(f"Atlas / {tool_id}", tb, "", "", content))
+
+
 @admin_router.get("/", response_class=HTMLResponse, include_in_schema=False)
 async def admin_panel(
     section: str = Query(default="securities"),
@@ -315,6 +406,8 @@ async def admin_panel(
                     v = row.get(h)
                     if h == "active":
                         tds += f'<td style="font-family:inherit"><span class="badge {"green" if v else "red"}">{"Active" if v else "Revoked"}</span></td>'
+                    elif h == "key_id":
+                        tds += f'<td style="font-family:inherit"><a href="/admin/keys/{v}" style="color:#111;font-weight:500;text-decoration:underline;text-underline-offset:2px">{v}</a></td>'
                     elif v is None:
                         tds += '<td style="color:#d4d4d4">—</td>'
                     else:
