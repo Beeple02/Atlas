@@ -385,6 +385,19 @@ async def get_price_history(ticker: str, days: int = 30, limit: int = 500,
     )
 
 
+async def get_all_price_history(limit: int = 100, since: str = None) -> list[dict]:
+    """All tickers, ordered by timestamp DESC. Used by /transactions."""
+    if since:
+        return await _fetchall(
+            "SELECT * FROM price_history WHERE timestamp >= ? ORDER BY timestamp DESC LIMIT ?",
+            (since, limit)
+        )
+    return await _fetchall(
+        "SELECT * FROM price_history ORDER BY timestamp DESC LIMIT ?",
+        (limit,)
+    )
+
+
 # ── OHLCV ─────────────────────────────────────────────────────────────────────
 
 async def upsert_ohlcv(ticker: str, candles: list[dict]) -> None:
