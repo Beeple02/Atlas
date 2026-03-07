@@ -323,7 +323,167 @@ async def ner_webhook(request: Request):
     return {"status": "ok"}
 
 
-# ── Admin: force refresh ──────────────────────────────────────────────────────
+# ── Analytics: OHLCV + indicators ────────────────────────────────────────────
+
+@router.get("/analytics/ohlcv/{ticker}")
+async def analytics_ohlcv(
+    ticker: str,
+    days: int = Query(default=365, ge=1, le=365),
+    _auth=Depends(require_auth),
+):
+    await _assert_initialized()
+    ticker = ticker.upper()
+    await _assert_ticker_exists(ticker)
+    from computation import compute_ohlcv_analytics
+    candles = await db.get_ohlcv(ticker, days=days)
+    if not candles:
+        raise HTTPException(status_code=404, detail={"detail": "No OHLCV data available.", "code": "NO_DATA"})
+    analytics = compute_ohlcv_analytics(candles)
+    return {"ticker": ticker, "candles": candles, **analytics}
+
+
+# ── Analytics: ticker deep-dive stats ────────────────────────────────────────
+
+@router.get("/analytics/ticker_stats/{ticker}")
+async def ticker_stats(
+    ticker: str,
+    days: int = Query(default=365, ge=1, le=365),
+    _auth=Depends(require_auth),
+):
+    await _assert_initialized()
+    ticker = ticker.upper()
+    await _assert_ticker_exists(ticker)
+    from computation import compute_ohlcv_analytics
+    candles  = await db.get_ohlcv(ticker, days=days)
+    derived  = await db.get_derived(ticker) or {}
+    stats    = await db.get_stats(ticker) or {}
+    analytics = compute_ohlcv_analytics(candles) if candles else {}
+    return {
+        "ticker":  ticker,
+        "candles": candles,
+        **analytics,
+        "vwap_24h":            derived.get("vwap_24h"),
+        "vwap_7d":             derived.get("vwap_7d"),
+        "volatility_7d":       derived.get("volatility_7d"),
+        "spread":              derived.get("spread"),
+        "spread_pct":          derived.get("spread_pct"),
+        "orderbook_imbalance": derived.get("orderbook_imbalance"),
+        "liquidity_score":     derived.get("liquidity_score"),
+        "eps":         stats.get("eps"),
+        "pe_ratio":    stats.get("pe_ratio"),
+        "pb_ratio":    stats.get("pb_ratio"),
+        "roa_percent": stats.get("roa_percent"),
+        "book_value":  stats.get("book_value"),
+        "net_profit":  stats.get("net_profit"),
+    }
+
+
+# ── Transactions (public trade tape) ─────────────────────────────────────────
+
+@router.get("/transactions")
+async def get_transactions(
+    ticker: Optional[str] = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=1000),
+    since: Optional[str] = Query(default=None),
+):
+    """Public trade tape — no auth required."""
+    if ticker:
+        records = await db.get_price_history(ticker.upper(), days=365, limit=limit, from_dt=since)
+    else:
+        records = await db.get_all_price_history(limit=limit, since=since)
+    result = []
+    for r in records:
+        qty, price = r.get("volume"), r.get("price")
+        result.append({
+            "id":        r.get("id"),
+            "ticker":    r.get("ticker"),
+            "price":     price,
+            "quantity":  qty,
+            "amount":    round(price * qty, 4) if price and qty else None,
+            "timestamp": r.get("timestamp"),
+            "type":      "trade",
+        })
+    return result
+
+
+# ── Holder intelligence ───────────────────────────────────────────────────────
+
+@router.get("/holder_intel/{ticker}")
+async def holder_intel(ticker: str, _auth=Depends(require_auth)):
+    await _assert_initialized()
+    ticker = ticker.upper()
+    sec = await _assert_ticker_exists(ticker)
+    shareholders = await db.get_shareholders(ticker)
+    total_shares = sec.get("total_shares") or 0
+    from computation import compute_holder_intel
+    intel = compute_holder_intel(shareholders, total_shares)
+    top_qty = intel.get("holders", [{}])[0].get("quantity", 0) if intel.get("holders") else 0
+    return {
+        "ticker":       ticker,
+        "total_shares": total_shares,
+        "float_pct":    round(top_qty / total_shares * 100, 4) if total_shares else 0,
+        **intel,
+    }
+
+
+# ── Market breadth ────────────────────────────────────────────────────────────
+
+@router.get("/market/breadth")
+async def market_breadth(days: int = Query(default=7, ge=1, le=365)):
+    """Public endpoint — no auth required."""
+    await _assert_initialized()
+    securities  = await db.get_all_securities()
+    derived_map = {d["ticker"]: d for d in await db.get_all_derived()}
+
+    advancing = declining = unchanged = 0
+    result_securities = []
+
+    for sec in securities:
+        ticker = sec["ticker"]
+        d = derived_map.get(ticker, {})
+
+        records = await db.get_price_history(ticker, days=days, limit=500)
+        chg_pct = None
+        if len(records) >= 2:
+            sorted_rec = sorted(records, key=lambda r: r.get("timestamp", ""))
+            oldest, newest = sorted_rec[0].get("price"), sorted_rec[-1].get("price")
+            if oldest and oldest > 0:
+                chg_pct = round((newest - oldest) / oldest * 100, 4)
+
+        if chg_pct is None or abs(chg_pct) < 0.01:
+            unchanged += 1
+        elif chg_pct > 0:
+            advancing += 1
+        else:
+            declining += 1
+
+        records_52w = await db.get_price_history(ticker, days=365, limit=5000)
+        prices_52w  = [r["price"] for r in records_52w if r.get("price")]
+
+        result_securities.append({
+            "ticker":     ticker,
+            "chg_pct":    chg_pct,
+            "volatility": d.get("volatility_7d"),
+            "sharpe":     None,
+            "market_cap": sec.get("market_cap"),
+            "hi52":       round(max(prices_52w), 4) if prices_52w else None,
+            "lo52":       round(min(prices_52w), 4) if prices_52w else None,
+            "vol_spike":  None,
+        })
+
+    return {
+        "summary": {
+            "advancing": advancing,
+            "declining": declining,
+            "unchanged": unchanged,
+            "total":     len(securities),
+        },
+        "securities":   result_securities,
+        "generated_at": _utcnow(),
+    }
+
+
+# ── Admin: key management ──────────────────────────────────────────────────────
 
 @router.post("/admin/refresh/{ticker}")
 async def force_refresh_ticker(ticker: str, _auth=Depends(require_auth)):
