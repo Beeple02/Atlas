@@ -323,6 +323,18 @@ async def get_all_orderbooks() -> list[dict]:
     return rows
 
 
+async def get_orderbook_history(ticker: str | None = None, limit: int = 500) -> list[dict]:
+    if ticker:
+        return await _fetchall(
+            "SELECT * FROM orderbook_history WHERE ticker = ? ORDER BY captured_at DESC LIMIT ?",
+            (ticker.upper(), limit)
+        )
+    return await _fetchall(
+        "SELECT * FROM orderbook_history ORDER BY captured_at DESC LIMIT ?",
+        (limit,)
+    )
+
+
 # ── Price history ─────────────────────────────────────────────────────────────
 
 def _normalize_timestamp(ts: str | None) -> str | None:
