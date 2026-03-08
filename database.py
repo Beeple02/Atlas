@@ -404,18 +404,19 @@ async def upsert_orderbook(ticker: str, data: dict) -> None:
     now = _now()
     bids = json.dumps(data.get("bids", []))
     asks = json.dumps(data.get("asks", []))
+    source = data.get("source", "ner")
     await _execute(
         """INSERT OR REPLACE INTO orderbook_cache
-           (ticker, bids, asks, best_bid, best_ask, mid, captured_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (ticker, bids, asks, data.get("best_bid"), data.get("best_ask"), data.get("mid"), now)
+           (ticker, bids, asks, best_bid, best_ask, mid, source, captured_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (ticker, bids, asks, data.get("best_bid"), data.get("best_ask"), data.get("mid"), source, now)
     )
     # Also append to history
     await _execute(
         """INSERT INTO orderbook_history
-           (ticker, bids, asks, best_bid, best_ask, mid, captured_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (ticker, bids, asks, data.get("best_bid"), data.get("best_ask"), data.get("mid"), now)
+           (ticker, bids, asks, best_bid, best_ask, mid, source, captured_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (ticker, bids, asks, data.get("best_bid"), data.get("best_ask"), data.get("mid"), source, now)
     )
 
 
