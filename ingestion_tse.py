@@ -78,16 +78,20 @@ async def poll_tse_securities() -> None:
     for s in stocks:
         symbol = s.get("symbol") or s.get("ticker") or ""
         ticker = _prefix(symbol)
+        # TSE returns numeric fields as strings — cast safely
+        def _float(v):
+            try: return float(v) if v is not None else None
+            except (ValueError, TypeError): return None
         securities.append({
             "ticker": ticker,
-            "full_name": s.get("name") or s.get("company_name") or s.get("full_name"),
-            "market_price": s.get("price") or s.get("last_price") or s.get("market_price"),
+            "full_name": s.get("company_name") or s.get("name") or s.get("full_name"),
+            "market_price": _float(s.get("current_price") or s.get("price") or s.get("last_price")),
             "total_shares": s.get("total_shares") or s.get("shares_outstanding"),
-            "market_cap": s.get("market_cap"),
+            "market_cap": _float(s.get("market_cap")),
             "shareholder_count": s.get("shareholder_count") or s.get("holder_count"),
-            "frozen": s.get("frozen", False),
-            "hidden": s.get("hidden", False),
-            "security_type": "stock",
+            "frozen": s.get("status", "active") != "active",
+            "hidden": False,
+            "security_type": s.get("sector") or "stock",
         })
 
     if securities:
@@ -229,61 +233,63 @@ async def _enrich_option(contract_id: str) -> Optional[dict]:
 
 
 async def poll_tse_options() -> None:
-    """Fetch all active options contracts + enrich with full detail."""
+    """Fetch all options contracts (all statuses) for historical record + active monitoring."""
     if not TSE_ENABLED:
         return
 
-    data = await _get("/api/v1/options/contracts", params={"status": "active"})
+    # Fetch all contracts — no status filter, we store everything
+    data = await _get("/api/v1/options/contracts")
     if not data:
         return
 
     contracts_raw = data if isinstance(data, list) else data.get("contracts", data.get("data", []))
-    logger.info("TSE options: found %d active contracts", len(contracts_raw))
+    logger.info("TSE options: found %d contracts", len(contracts_raw))
+
+    def _f(v):
+        try: return float(v) if v is not None else None
+        except (ValueError, TypeError): return None
 
     for c in contracts_raw:
-        contract_id = c.get("id") or c.get("contract_id")
+        contract_id = c.get("contract_id") or c.get("id")
         if not contract_id:
             continue
 
-        # Fetch full detail (includes delta, intrinsic_value, theoretical_price)
-        detail = await _enrich_option(contract_id) or c
-
-        underlying_symbol = detail.get("underlying_symbol") or detail.get("symbol") or ""
-        underlying_ticker = _prefix(underlying_symbol.split(":")[0] if ":" in underlying_symbol else underlying_symbol)
-        strike = detail.get("strike_price") or detail.get("strike")
-        underlying_price = detail.get("underlying_price") or detail.get("spot_price")
-        option_type = (detail.get("option_type") or detail.get("type") or "call").lower()
-        expiration_ts = detail.get("expiration_date") or detail.get("expires_at") or detail.get("expiry")
-
-        hours = _hours_to_expiry(expiration_ts)
+        underlying_symbol = c.get("symbol") or ""
+        option_type = (c.get("option_type") or "call").lower()
+        strike = _f(c.get("strike_price"))
+        underlying_price = _f(c.get("underlying_price"))
+        expiration_ts = c.get("expiration_ts") or c.get("expiration_date") or c.get("expires_at")
+        status = (c.get("status") or "active").lower()
+        hours = _hours_to_expiry(expiration_ts) if status == "active" else None
         moneyness = _compute_moneyness(option_type, strike, underlying_price)
 
         await db.upsert_options_contract({
             "contract_id": contract_id,
             "symbol": _prefix(underlying_symbol),
-            "underlying_ticker": underlying_ticker,
+            "option_ticker": c.get("option_ticker"),
+            "underlying_ticker": _prefix(underlying_symbol),
             "option_type": option_type,
             "strike_price": strike,
-            "shares_per_contract": detail.get("shares_per_contract") or detail.get("contract_size"),
+            "shares_per_contract": c.get("shares_per_contract"),
+            "max_quantity": c.get("max_quantity"),
+            "premium": _f(c.get("premium")),
             "expiration_ts": expiration_ts,
-            "status": detail.get("status", "active"),
-            "current_price": detail.get("current_price") or detail.get("price"),
+            "status": status,
+            "current_price": _f(c.get("current_price")),
             "underlying_price": underlying_price,
-            "intrinsic_value": detail.get("intrinsic_value"),
-            "time_value": detail.get("time_value"),
-            "theoretical_price": detail.get("theoretical_price"),
-            "delta": detail.get("delta"),
+            "intrinsic_value": _f(c.get("intrinsic_value")),
+            "time_value": _f(c.get("time_value")),
+            "theoretical_price": _f(c.get("theoretical_price")),
+            "delta": _f(c.get("delta")),
             "moneyness": moneyness,
             "hours_to_expiry": hours,
-            "best_bid": detail.get("best_bid"),
-            "best_ask": detail.get("best_ask"),
-            "volume_24h": detail.get("volume_24h") or detail.get("volume"),
+            "best_bid": _f(c.get("best_bid")),
+            "best_ask": _f(c.get("best_ask")),
+            "volume_24h": _f(c.get("volume_24h") or c.get("volume")),
         })
 
-        await asyncio.sleep(0.05)  # avoid hammering detail endpoint
-
     await db.set_meta("tse_last_options_poll", datetime.now(timezone.utc).isoformat())
-    logger.info("TSE: polled %d options contracts", len(contracts_raw))
+    logger.info("TSE: stored %d options contracts", len(contracts_raw))
 
 
 # ── Bonds ─────────────────────────────────────────────────────────────────────
