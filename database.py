@@ -141,10 +141,13 @@ CREATE TABLE IF NOT EXISTS derived_metrics (
 CREATE TABLE IF NOT EXISTS options_contracts (
     contract_id         TEXT PRIMARY KEY,
     symbol              TEXT NOT NULL,        -- TSE:GCC etc
+    option_ticker       TEXT,                 -- e.g. GCC-260226C12
     underlying_ticker   TEXT NOT NULL,
     option_type         TEXT NOT NULL,        -- 'call' | 'put'
     strike_price        REAL,
     shares_per_contract INTEGER,
+    max_quantity        INTEGER,
+    premium             REAL,
     expiration_ts       TEXT,
     status              TEXT DEFAULT 'active', -- 'active' | 'expired' | 'settled'
     current_price       REAL,
@@ -306,6 +309,15 @@ async def init_db() -> None:
             logger.info("Migrating ohlcv: adding interval column...")
             await conn.execute("ALTER TABLE ohlcv ADD COLUMN interval TEXT DEFAULT '1d'")
             await conn.commit()
+
+        # Migration: add option_ticker, max_quantity, premium to options_contracts if missing
+        cur = await conn.execute("PRAGMA table_info(options_contracts)")
+        cols = [row[1] for row in await cur.fetchall()]
+        for col, typedef in [("option_ticker", "TEXT"), ("max_quantity", "INTEGER"), ("premium", "REAL")]:
+            if col not in cols:
+                logger.info("Migrating options_contracts: adding %s column...", col)
+                await conn.execute(f"ALTER TABLE options_contracts ADD COLUMN {col} {typedef}")
+                await conn.commit()
 
     logger.info("Database initialized: %s", DB)
 
@@ -728,15 +740,16 @@ async def upsert_options_contract(c: dict) -> None:
     now = _now()
     await _execute(
         """INSERT OR REPLACE INTO options_contracts
-           (contract_id, symbol, underlying_ticker, option_type, strike_price,
-            shares_per_contract, expiration_ts, status, current_price, underlying_price,
-            intrinsic_value, time_value, theoretical_price, delta,
-            moneyness, hours_to_expiry, best_bid, best_ask, volume_24h,
-            last_polled_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+           (contract_id, symbol, option_ticker, underlying_ticker, option_type, strike_price,
+            shares_per_contract, max_quantity, premium, expiration_ts, status,
+            current_price, underlying_price, intrinsic_value, time_value,
+            theoretical_price, delta, moneyness, hours_to_expiry,
+            best_bid, best_ask, volume_24h, last_polled_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
-            c["contract_id"], c.get("symbol"), c.get("underlying_ticker"),
+            c["contract_id"], c.get("symbol"), c.get("option_ticker"), c.get("underlying_ticker"),
             c.get("option_type"), c.get("strike_price"), c.get("shares_per_contract"),
+            c.get("max_quantity"), c.get("premium"),
             c.get("expiration_ts"), c.get("status", "active"),
             c.get("current_price"), c.get("underlying_price"),
             c.get("intrinsic_value"), c.get("time_value"),
