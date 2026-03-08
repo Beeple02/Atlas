@@ -551,3 +551,152 @@ async def create_key(
 async def revoke_key(tool_id: str, _auth=Depends(require_auth)):
     await db.deactivate_api_key(tool_id)
     return {"status": "revoked", "tool_id": tool_id}
+
+
+# ── TSE: Options ──────────────────────────────────────────────────────────────
+
+@router.get("/options")
+async def list_options(
+    symbol: Optional[str] = Query(None, description="Filter by underlying symbol e.g. TSE:GCC"),
+    option_type: Optional[str] = Query(None, description="'call' or 'put'"),
+    include_expired: bool = Query(False, description="Include expired contracts"),
+    _auth=Depends(require_auth),
+):
+    """List options contracts. Returns active only by default."""
+    contracts = await db.get_all_options_contracts(
+        active_only=not include_expired,
+        symbol=symbol,
+        option_type=option_type,
+    )
+    return {
+        "count": len(contracts),
+        "active_only": not include_expired,
+        "filters": {"symbol": symbol, "option_type": option_type},
+        "data": contracts,
+    }
+
+
+@router.get("/options/{contract_id}")
+async def get_option(contract_id: str, _auth=Depends(require_auth)):
+    """Full detail for a single options contract."""
+    contract = await db.get_options_contract(contract_id)
+    if not contract:
+        raise HTTPException(
+            status_code=404,
+            detail={"detail": f"Options contract '{contract_id}' not found.", "code": "NOT_FOUND"}
+        )
+    return contract
+
+
+# ── TSE: Bonds ────────────────────────────────────────────────────────────────
+
+@router.get("/bonds")
+async def list_bonds(
+    bond_type: Optional[str] = Query(None, description="treasury | corporate | municipal | government"),
+    include_matured: bool = Query(False, description="Include matured/expired bonds"),
+    _auth=Depends(require_auth),
+):
+    """List all bonds. Returns active only by default."""
+    bonds = await db.get_all_bonds(active_only=not include_matured, bond_type=bond_type)
+    return {
+        "count": len(bonds),
+        "active_only": not include_matured,
+        "filters": {"bond_type": bond_type},
+        "data": bonds,
+    }
+
+
+@router.get("/bonds/{symbol}")
+async def get_bond(
+    symbol: str,
+    history_days: int = Query(30, description="Days of price history to include"),
+    _auth=Depends(require_auth),
+):
+    """Full detail for a bond by symbol, including price history."""
+    bond = await db.get_bond_by_symbol(symbol.upper())
+    if not bond:
+        raise HTTPException(
+            status_code=404,
+            detail={"detail": f"Bond '{symbol}' not found.", "code": "NOT_FOUND"}
+        )
+    price_history = await db.get_bond_price_history(bond["bond_id"], days=history_days)
+    return {**bond, "price_history": price_history}
+
+
+# ── TSE: Prediction contracts ─────────────────────────────────────────────────
+
+@router.get("/contracts/predictions")
+async def list_prediction_contracts(
+    include_resolved: bool = Query(False, description="Include resolved/expired contracts"),
+    _auth=Depends(require_auth),
+):
+    """List prediction market contracts."""
+    contracts = await db.get_all_prediction_contracts(active_only=not include_resolved)
+    return {
+        "count": len(contracts),
+        "active_only": not include_resolved,
+        "data": contracts,
+    }
+
+
+@router.get("/contracts/predictions/{contract_id}")
+async def get_prediction_contract(contract_id: str, _auth=Depends(require_auth)):
+    """Full detail for a single prediction contract."""
+    contract = await db.get_prediction_contract(contract_id)
+    if not contract:
+        raise HTTPException(
+            status_code=404,
+            detail={"detail": f"Prediction contract '{contract_id}' not found.", "code": "NOT_FOUND"}
+        )
+    return contract
+
+
+# ── TSE: Source-filtered securities ──────────────────────────────────────────
+
+@router.get("/securities/source/{source}")
+async def get_securities_by_source(
+    source: str,
+    _auth=Depends(require_auth),
+):
+    """Get all securities from a specific source: 'ner' or 'tse'."""
+    source = source.lower()
+    if source not in ("ner", "tse"):
+        raise HTTPException(status_code=400, detail="source must be 'ner' or 'tse'")
+    securities = await db.get_all_securities_by_source(source)
+    return {"source": source, "count": len(securities), "data": securities}
+
+
+# ── TSE status ────────────────────────────────────────────────────────────────
+
+@router.get("/tse/status")
+async def tse_status(_auth=Depends(require_auth)):
+    """TSE integration status — last poll times and asset counts."""
+    from config import settings as cfg
+    keys = [
+        "tse_last_securities_poll",
+        "tse_last_price_poll",
+        "tse_last_ohlcv_poll",
+        "tse_last_options_poll",
+        "tse_last_bonds_poll",
+        "tse_last_contracts_poll",
+    ]
+    meta = {}
+    for k in keys:
+        meta[k] = await db.get_meta(k)
+
+    import aiosqlite
+    counts = {}
+    for table in ["options_contracts", "bonds", "bond_price_history", "prediction_contracts"]:
+        async with aiosqlite.connect(cfg.db_path) as conn:
+            cur = await conn.execute(f"SELECT COUNT(*) FROM {table}")
+            counts[table] = (await cur.fetchone())[0]
+
+    tse_secs = await db.get_all_securities_by_source("tse")
+
+    return {
+        "tse_enabled": bool(cfg.tse_api_key),
+        "tse_base_url": cfg.tse_base_url,
+        "securities_count": len(tse_secs),
+        "asset_counts": counts,
+        "last_polls": meta,
+    }
