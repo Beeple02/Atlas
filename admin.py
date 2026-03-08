@@ -19,17 +19,22 @@ logger = logging.getLogger(__name__)
 admin_router = APIRouter(prefix="/admin")
 
 SECTIONS = [
-    ("securities",         "Securities"),
-    ("orderbook",          "Orderbook"),
-    ("orderbook_history",  "OB History"),
-    ("price_history",      "Price History"),
-    ("ohlcv",              "OHLCV"),
-    ("derived",            "Derived Metrics"),
-    ("shareholders",       "Shareholders"),
-    ("api_keys",           "API Keys"),
-    ("meta",               "Meta"),
+    ("securities",              "Securities"),
+    ("orderbook",               "Orderbook"),
+    ("orderbook_history",       "OB History"),
+    ("price_history",           "Price History"),
+    ("ohlcv",                   "OHLCV"),
+    ("derived",                 "Derived Metrics"),
+    ("shareholders",            "Shareholders"),
+    ("options_contracts",       "Options"),
+    ("bonds",                   "Bonds"),
+    ("bond_price_history",      "Bond History"),
+    ("prediction_contracts",    "Predictions"),
+    ("api_keys",                "API Keys"),
+    ("meta",                    "Meta"),
 ]
-FILTERABLE = {"orderbook", "orderbook_history", "price_history", "ohlcv", "shareholders"}
+FILTERABLE = {"orderbook", "orderbook_history", "price_history", "ohlcv", "shareholders",
+              "options_contracts", "bonds", "bond_price_history"}
 
 
 # ── Data fetcher ──────────────────────────────────────────────────────────────
@@ -75,12 +80,34 @@ async def _get_data(section: str, ticker: str | None) -> list[dict]:
     elif section == "meta":
         keys = ["atlas_initialized", "ner_reachable", "last_poll_securities",
                 "last_poll_orderbook", "last_poll_price_history", "last_poll_ohlcv",
-                "last_poll_shareholders", "last_poll_stats", "ner_rate_limited_at"]
+                "last_poll_shareholders", "last_poll_stats", "ner_rate_limited_at",
+                "tse_last_securities_poll", "tse_last_price_poll", "tse_last_ohlcv_poll",
+                "tse_last_options_poll", "tse_last_bonds_poll", "tse_last_contracts_poll"]
         rows = []
         for k in keys:
             v = await db.get_meta(k)
             rows.append({"key": k, "value": v or ""})
         return rows
+    elif section == "options_contracts":
+        include_expired = ticker == "__all__"
+        symbol_filter = ticker if ticker and ticker != "__all__" else None
+        return await db.get_all_options_contracts(active_only=not include_expired, symbol=symbol_filter)
+    elif section == "bonds":
+        include_matured = ticker == "__all__"
+        return await db.get_all_bonds(active_only=not include_matured)
+    elif section == "bond_price_history":
+        if ticker:
+            bond = await db.get_bond_by_symbol(ticker.upper())
+            if bond:
+                return await db.get_bond_price_history(bond["bond_id"], days=365, limit=5000)
+        import aiosqlite
+        from config import settings as cfg
+        async with aiosqlite.connect(cfg.db_path) as conn:
+            conn.row_factory = aiosqlite.Row
+            cur = await conn.execute("SELECT * FROM bond_price_history ORDER BY timestamp DESC LIMIT 2000")
+            return [dict(r) for r in await cur.fetchall()]
+    elif section == "prediction_contracts":
+        return await db.get_all_prediction_contracts(active_only=False)
     return []
 
 
