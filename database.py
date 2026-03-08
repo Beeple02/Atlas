@@ -29,6 +29,7 @@ PRAGMA journal_mode=WAL;
 PRAGMA foreign_keys=ON;
 
 -- All known securities (live cache, one row per ticker)
+-- ticker is prefixed: NER:XXX or TSE:XXX
 CREATE TABLE IF NOT EXISTS securities (
     ticker              TEXT PRIMARY KEY,
     full_name           TEXT,
@@ -39,6 +40,7 @@ CREATE TABLE IF NOT EXISTS securities (
     frozen              INTEGER DEFAULT 0,
     hidden              INTEGER DEFAULT 0,
     security_type       TEXT,
+    source              TEXT DEFAULT 'ner',   -- 'ner' | 'tse'
     updated_at          TEXT
 );
 
@@ -50,6 +52,7 @@ CREATE TABLE IF NOT EXISTS orderbook_cache (
     best_bid        REAL,
     best_ask        REAL,
     mid             REAL,
+    source          TEXT DEFAULT 'ner',
     captured_at     TEXT
 );
 
@@ -62,19 +65,20 @@ CREATE TABLE IF NOT EXISTS orderbook_history (
     best_bid        REAL,
     best_ask        REAL,
     mid             REAL,
+    source          TEXT DEFAULT 'ner',
     captured_at     TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_ob_hist ON orderbook_history(ticker, captured_at);
 
--- Trade-level price history (append-only, sourced from NER + webhooks)
+-- Trade-level price history (append-only, sourced from NER + webhooks + TSE)
 CREATE TABLE IF NOT EXISTS price_history (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     ticker      TEXT NOT NULL,
     price       REAL NOT NULL,
     volume      INTEGER,
     timestamp   TEXT NOT NULL,
-    source      TEXT DEFAULT 'ner_api',  -- 'ner_api' | 'webhook'
-    UNIQUE(ticker, timestamp, price)
+    source      TEXT DEFAULT 'ner',
+    UNIQUE(ticker, timestamp, price, source)
 );
 CREATE INDEX IF NOT EXISTS idx_ph ON price_history(ticker, timestamp);
 
@@ -88,7 +92,9 @@ CREATE TABLE IF NOT EXISTS ohlcv (
     low         REAL,
     close       REAL,
     volume      INTEGER,
-    UNIQUE(ticker, date)
+    source      TEXT DEFAULT 'ner',
+    interval    TEXT DEFAULT '1d',
+    UNIQUE(ticker, date, source, interval)
 );
 CREATE INDEX IF NOT EXISTS idx_ohlcv ON ohlcv(ticker, date);
 
@@ -98,6 +104,7 @@ CREATE TABLE IF NOT EXISTS shareholders (
     user_id     TEXT NOT NULL,
     quantity    INTEGER,
     cost_basis  REAL,
+    source      TEXT DEFAULT 'ner',
     updated_at  TEXT,
     PRIMARY KEY (ticker, user_id)
 );
@@ -126,8 +133,97 @@ CREATE TABLE IF NOT EXISTS derived_metrics (
     ask_depth               REAL,
     orderbook_imbalance     REAL,
     liquidity_score         REAL,
+    source                  TEXT DEFAULT 'ner',
     last_computed_at        TEXT
 );
+
+-- TSE Options contracts
+CREATE TABLE IF NOT EXISTS options_contracts (
+    contract_id         TEXT PRIMARY KEY,
+    symbol              TEXT NOT NULL,        -- TSE:GCC etc
+    underlying_ticker   TEXT NOT NULL,
+    option_type         TEXT NOT NULL,        -- 'call' | 'put'
+    strike_price        REAL,
+    shares_per_contract INTEGER,
+    expiration_ts       TEXT,
+    status              TEXT DEFAULT 'active', -- 'active' | 'expired' | 'settled'
+    current_price       REAL,
+    underlying_price    REAL,
+    intrinsic_value     REAL,
+    time_value          REAL,
+    theoretical_price   REAL,
+    delta               REAL,
+    -- computed enrichment
+    moneyness           TEXT,                 -- 'ITM' | 'OTM' | 'ATM'
+    hours_to_expiry     REAL,
+    -- market data
+    best_bid            REAL,
+    best_ask            REAL,
+    volume_24h          REAL,
+    last_polled_at      TEXT,
+    updated_at          TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_options_symbol ON options_contracts(symbol, status);
+CREATE INDEX IF NOT EXISTS idx_options_expiry ON options_contracts(expiration_ts, status);
+
+-- TSE Bonds
+CREATE TABLE IF NOT EXISTS bonds (
+    bond_id             TEXT PRIMARY KEY,
+    symbol              TEXT NOT NULL,
+    issuer_name         TEXT,
+    bond_type           TEXT,                 -- 'treasury' | 'corporate' | 'municipal' | 'government'
+    face_value          REAL,
+    coupon_rate         REAL,
+    coupon_frequency    TEXT,
+    maturity_date       TEXT,
+    status              TEXT DEFAULT 'active', -- 'active' | 'matured' | 'defaulted'
+    current_price       REAL,
+    yield_to_maturity   REAL,
+    accrued_interest    REAL,
+    dirty_price         REAL,
+    days_to_maturity    INTEGER,
+    best_bid            REAL,
+    best_ask            REAL,
+    volume_24h          REAL,
+    last_polled_at      TEXT,
+    updated_at          TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_bonds_symbol ON bonds(symbol, status);
+
+-- TSE Bond price history (like price_history but for bonds)
+CREATE TABLE IF NOT EXISTS bond_price_history (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    bond_id         TEXT NOT NULL,
+    symbol          TEXT NOT NULL,
+    price           REAL NOT NULL,
+    volume          INTEGER,
+    timestamp       TEXT NOT NULL,
+    UNIQUE(bond_id, timestamp, price)
+);
+CREATE INDEX IF NOT EXISTS idx_bond_ph ON bond_price_history(bond_id, timestamp);
+
+-- TSE Prediction/event contracts
+CREATE TABLE IF NOT EXISTS prediction_contracts (
+    contract_id         TEXT PRIMARY KEY,
+    title               TEXT,
+    description         TEXT,
+    status              TEXT DEFAULT 'active', -- 'active' | 'resolved' | 'cancelled'
+    outcome             TEXT,                  -- null until resolved
+    yes_price           REAL,
+    no_price            REAL,
+    yes_reserves        REAL,
+    no_reserves         REAL,
+    volume_24h          REAL,
+    total_volume        REAL,
+    expiration_ts       TEXT,
+    -- computed
+    implied_prob_yes    REAL,
+    hours_to_expiry     REAL,
+    last_polled_at      TEXT,
+    updated_at          TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_pred_status ON prediction_contracts(status);
+CREATE INDEX IF NOT EXISTS idx_pred_expiry ON prediction_contracts(expiration_ts, status);
 
 -- Per-tool API keys for Atlas authentication
 CREATE TABLE IF NOT EXISTS api_keys (
@@ -182,17 +278,34 @@ async def init_db() -> None:
                     price     REAL NOT NULL,
                     volume    INTEGER,
                     timestamp TEXT NOT NULL,
-                    source    TEXT DEFAULT 'ner_api',
-                    UNIQUE(ticker, timestamp, price)
+                    source    TEXT DEFAULT 'ner',
+                    UNIQUE(ticker, timestamp, price, source)
                 );
                 INSERT OR IGNORE INTO price_history_new(ticker, price, volume, timestamp, source)
-                    SELECT ticker, price, volume, timestamp, source FROM price_history;
+                    SELECT ticker, price, volume, timestamp, COALESCE(source, 'ner') FROM price_history;
                 DROP TABLE price_history;
                 ALTER TABLE price_history_new RENAME TO price_history;
                 CREATE INDEX IF NOT EXISTS idx_ph ON price_history(ticker, timestamp);
             """)
             await conn.commit()
             logger.info("Migration complete: price_history deduplicated.")
+
+        # Migration: add source column to tables that may not have it yet
+        for table in ["securities", "orderbook_cache", "orderbook_history", "ohlcv", "shareholders", "derived_metrics"]:
+            cur = await conn.execute(f"PRAGMA table_info({table})")
+            cols = [row[1] for row in await cur.fetchall()]
+            if "source" not in cols:
+                logger.info("Migrating %s: adding source column...", table)
+                await conn.execute(f"ALTER TABLE {table} ADD COLUMN source TEXT DEFAULT 'ner'")
+                await conn.commit()
+
+        # Migration: add interval column to ohlcv if missing
+        cur = await conn.execute("PRAGMA table_info(ohlcv)")
+        cols = [row[1] for row in await cur.fetchall()]
+        if "interval" not in cols:
+            logger.info("Migrating ohlcv: adding interval column...")
+            await conn.execute("ALTER TABLE ohlcv ADD COLUMN interval TEXT DEFAULT '1d'")
+            await conn.commit()
 
     logger.info("Database initialized: %s", DB)
 
@@ -567,7 +680,250 @@ async def get_key_stats(key_id: str) -> dict:
 
 async def get_db_stats() -> dict:
     counts = {}
-    for table in ["securities", "price_history", "ohlcv", "orderbook_history", "shareholders"]:
+    for table in ["securities", "price_history", "ohlcv", "orderbook_history", "shareholders",
+                  "options_contracts", "bonds", "prediction_contracts"]:
         row = await _fetchone(f"SELECT COUNT(*) as n FROM {table}")
         counts[table] = row["n"] if row else 0
     return counts
+
+
+# ── TSE Securities (source-aware wrappers) ────────────────────────────────────
+
+async def upsert_securities_with_source(securities: list[dict], source: str) -> None:
+    now = _now()
+    await _executemany(
+        """INSERT OR REPLACE INTO securities
+           (ticker, full_name, market_price, total_shares, market_cap,
+            shareholder_count, frozen, hidden, security_type, source, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        [(
+            s.get("ticker"),
+            s.get("full_name"),
+            s.get("market_price"),
+            s.get("total_shares"),
+            s.get("market_cap"),
+            s.get("shareholder_count"),
+            int(s.get("frozen", False)),
+            int(s.get("hidden", False)),
+            s.get("security_type"),
+            source,
+            now,
+        ) for s in securities]
+    )
+
+
+async def get_all_securities_by_source(source: str = None) -> list[dict]:
+    if source:
+        return await _fetchall(
+            "SELECT * FROM securities WHERE hidden = 0 AND source = ? ORDER BY ticker",
+            (source,)
+        )
+    return await _fetchall("SELECT * FROM securities WHERE hidden = 0 ORDER BY ticker")
+
+
+# ── Options contracts ─────────────────────────────────────────────────────────
+
+async def upsert_options_contract(c: dict) -> None:
+    now = _now()
+    await _execute(
+        """INSERT OR REPLACE INTO options_contracts
+           (contract_id, symbol, underlying_ticker, option_type, strike_price,
+            shares_per_contract, expiration_ts, status, current_price, underlying_price,
+            intrinsic_value, time_value, theoretical_price, delta,
+            moneyness, hours_to_expiry, best_bid, best_ask, volume_24h,
+            last_polled_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            c["contract_id"], c.get("symbol"), c.get("underlying_ticker"),
+            c.get("option_type"), c.get("strike_price"), c.get("shares_per_contract"),
+            c.get("expiration_ts"), c.get("status", "active"),
+            c.get("current_price"), c.get("underlying_price"),
+            c.get("intrinsic_value"), c.get("time_value"),
+            c.get("theoretical_price"), c.get("delta"),
+            c.get("moneyness"), c.get("hours_to_expiry"),
+            c.get("best_bid"), c.get("best_ask"), c.get("volume_24h"),
+            now, now,
+        )
+    )
+
+
+async def get_options_contract(contract_id: str) -> Optional[dict]:
+    return await _fetchone(
+        "SELECT * FROM options_contracts WHERE contract_id = ?", (contract_id,)
+    )
+
+
+async def get_all_options_contracts(active_only: bool = True, symbol: str = None,
+                                     option_type: str = None) -> list[dict]:
+    conditions = []
+    params = []
+    if active_only:
+        conditions.append("status = 'active'")
+    if symbol:
+        conditions.append("symbol = ?")
+        params.append(symbol.upper())
+    if option_type:
+        conditions.append("option_type = ?")
+        params.append(option_type.lower())
+    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+    return await _fetchall(
+        f"SELECT * FROM options_contracts {where} ORDER BY expiration_ts ASC",
+        tuple(params)
+    )
+
+
+async def expire_stale_options() -> int:
+    """Mark options past expiration_ts as expired. Returns count updated."""
+    now = _now()
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            "UPDATE options_contracts SET status = 'expired' "
+            "WHERE status = 'active' AND expiration_ts IS NOT NULL AND expiration_ts < ?",
+            (now,)
+        )
+        await db.commit()
+        return cur.rowcount
+
+
+# ── Bonds ─────────────────────────────────────────────────────────────────────
+
+async def upsert_bond(b: dict) -> None:
+    now = _now()
+    await _execute(
+        """INSERT OR REPLACE INTO bonds
+           (bond_id, symbol, issuer_name, bond_type, face_value, coupon_rate,
+            coupon_frequency, maturity_date, status, current_price, yield_to_maturity,
+            accrued_interest, dirty_price, days_to_maturity,
+            best_bid, best_ask, volume_24h, last_polled_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            b["bond_id"], b.get("symbol"), b.get("issuer_name"), b.get("bond_type"),
+            b.get("face_value"), b.get("coupon_rate"), b.get("coupon_frequency"),
+            b.get("maturity_date"), b.get("status", "active"),
+            b.get("current_price"), b.get("yield_to_maturity"),
+            b.get("accrued_interest"), b.get("dirty_price"), b.get("days_to_maturity"),
+            b.get("best_bid"), b.get("best_ask"), b.get("volume_24h"),
+            now, now,
+        )
+    )
+
+
+async def get_bond(bond_id: str) -> Optional[dict]:
+    return await _fetchone("SELECT * FROM bonds WHERE bond_id = ?", (bond_id,))
+
+
+async def get_bond_by_symbol(symbol: str) -> Optional[dict]:
+    return await _fetchone(
+        "SELECT * FROM bonds WHERE symbol = ? ORDER BY updated_at DESC LIMIT 1", (symbol,)
+    )
+
+
+async def get_all_bonds(active_only: bool = True, bond_type: str = None) -> list[dict]:
+    conditions = []
+    params = []
+    if active_only:
+        conditions.append("status = 'active'")
+    if bond_type:
+        conditions.append("bond_type = ?")
+        params.append(bond_type.lower())
+    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+    return await _fetchall(
+        f"SELECT * FROM bonds {where} ORDER BY maturity_date ASC",
+        tuple(params)
+    )
+
+
+async def insert_bond_price_history(bond_id: str, symbol: str, records: list[dict]) -> None:
+    if not records:
+        return
+    await _executemany(
+        """INSERT OR IGNORE INTO bond_price_history(bond_id, symbol, price, volume, timestamp)
+           VALUES (?, ?, ?, ?, ?)""",
+        [(bond_id, symbol, r.get("price"), r.get("volume"),
+          _normalize_timestamp(r.get("timestamp"))) for r in records]
+    )
+
+
+async def get_bond_price_history(bond_id: str, days: int = 30, limit: int = 500) -> list[dict]:
+    return await _fetchall(
+        """SELECT * FROM bond_price_history WHERE bond_id = ?
+           AND timestamp >= datetime('now', ?)
+           ORDER BY timestamp DESC LIMIT ?""",
+        (bond_id, f"-{days} days", limit)
+    )
+
+
+async def expire_matured_bonds() -> int:
+    """Mark bonds past maturity_date as matured. Returns count updated."""
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            "UPDATE bonds SET status = 'matured' "
+            "WHERE status = 'active' AND maturity_date IS NOT NULL AND maturity_date < ?",
+            (today,)
+        )
+        await db.commit()
+        return cur.rowcount
+
+
+# ── Prediction contracts ──────────────────────────────────────────────────────
+
+async def upsert_prediction_contract(c: dict) -> None:
+    now = _now()
+    await _execute(
+        """INSERT OR REPLACE INTO prediction_contracts
+           (contract_id, title, description, status, outcome,
+            yes_price, no_price, yes_reserves, no_reserves,
+            volume_24h, total_volume, expiration_ts,
+            implied_prob_yes, hours_to_expiry, last_polled_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            c["contract_id"], c.get("title"), c.get("description"),
+            c.get("status", "active"), c.get("outcome"),
+            c.get("yes_price"), c.get("no_price"),
+            c.get("yes_reserves"), c.get("no_reserves"),
+            c.get("volume_24h"), c.get("total_volume"),
+            c.get("expiration_ts"),
+            c.get("implied_prob_yes"), c.get("hours_to_expiry"),
+            now, now,
+        )
+    )
+
+
+async def get_prediction_contract(contract_id: str) -> Optional[dict]:
+    return await _fetchone(
+        "SELECT * FROM prediction_contracts WHERE contract_id = ?", (contract_id,)
+    )
+
+
+async def get_all_prediction_contracts(active_only: bool = True) -> list[dict]:
+    if active_only:
+        return await _fetchall(
+            "SELECT * FROM prediction_contracts WHERE status = 'active' ORDER BY expiration_ts ASC"
+        )
+    return await _fetchall("SELECT * FROM prediction_contracts ORDER BY updated_at DESC")
+
+
+async def expire_stale_predictions() -> int:
+    """Mark prediction contracts past expiration_ts as expired."""
+    now = _now()
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            "UPDATE prediction_contracts SET status = 'expired' "
+            "WHERE status = 'active' AND expiration_ts IS NOT NULL AND expiration_ts < ?",
+            (now,)
+        )
+        await db.commit()
+        return cur.rowcount
+
+
+# ── Combined expiry job ───────────────────────────────────────────────────────
+
+async def expire_all_stale() -> dict:
+    """Run all expiry checks. Called by APScheduler every minute."""
+    opts = await expire_stale_options()
+    bonds = await expire_matured_bonds()
+    preds = await expire_stale_predictions()
+    if opts or bonds or preds:
+        logger.info("Expiry sweep: %d options, %d bonds, %d predictions expired", opts, bonds, preds)
+    return {"options": opts, "bonds": bonds, "predictions": preds}
