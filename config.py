@@ -16,7 +16,7 @@ class Config:
     ner_base_url: str = field(default_factory=lambda: os.getenv("NER_BASE_URL", "http://150.230.117.88:8082"))
 
     # ── Atlas server ──────────────────────────────────────────────────────────
-    port: int = field(default_factory=lambda: int(os.getenv("ATLAS_PORT", "8000")))
+    port: int = field(default_factory=lambda: int(os.getenv("ATLAS_PORT") or os.getenv("PORT", "8000")))
     log_level: str = field(default_factory=lambda: os.getenv("ATLAS_LOG_LEVEL", "INFO"))
 
     # ── Database ──────────────────────────────────────────────────────────────
@@ -42,6 +42,23 @@ class Config:
 
     # ── NER API request timeout (seconds) ────────────────────────────────────
     ner_request_timeout: int = field(default_factory=lambda: int(os.getenv("NER_REQUEST_TIMEOUT", "10")))
+
+    # ── TSE API ───────────────────────────────────────────────────────────────
+    tse_api_key: Optional[str] = field(default_factory=lambda: os.getenv("TSE_API_KEY"))
+    tse_base_url: str = field(default_factory=lambda: os.getenv("TSE_BASE_URL", "https://exchange.tse.gg"))
+
+    # ── TSE polling intervals (seconds) ──────────────────────────────────────
+    poll_tse_securities_interval: int = field(default_factory=lambda: int(os.getenv("POLL_TSE_SECURITIES_INTERVAL", "300")))   # 5 min
+    poll_tse_price_interval: int = field(default_factory=lambda: int(os.getenv("POLL_TSE_PRICE_INTERVAL", "60")))              # 1 min
+    poll_tse_orderbook_interval: int = field(default_factory=lambda: int(os.getenv("POLL_TSE_ORDERBOOK_INTERVAL", "60")))      # 1 min
+    poll_tse_ohlcv_interval: int = field(default_factory=lambda: int(os.getenv("POLL_TSE_OHLCV_INTERVAL", "300")))             # 5 min
+    poll_tse_options_interval: int = field(default_factory=lambda: int(os.getenv("POLL_TSE_OPTIONS_INTERVAL", "120")))         # 2 min
+    poll_tse_bonds_interval: int = field(default_factory=lambda: int(os.getenv("POLL_TSE_BONDS_INTERVAL", "120")))             # 2 min
+    poll_tse_contracts_interval: int = field(default_factory=lambda: int(os.getenv("POLL_TSE_CONTRACTS_INTERVAL", "120")))     # 2 min
+    expire_contracts_interval: int = field(default_factory=lambda: int(os.getenv("EXPIRE_CONTRACTS_INTERVAL", "60")))          # 1 min
+
+    # ── TSE API request timeout (seconds) ────────────────────────────────────
+    tse_request_timeout: int = field(default_factory=lambda: int(os.getenv("TSE_REQUEST_TIMEOUT", "10")))
 
 
 # Singleton — import this everywhere
