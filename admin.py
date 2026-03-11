@@ -438,13 +438,54 @@ async def admin_panel(
     # Date range inputs — shown for time-series sections
     date_sections = {"price_history", "orderbook_history", "ohlcv", "bond_price_history",
                      "options_contracts", "bonds", "prediction_contracts"}
+
     date_html = ""
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
     if section in date_sections:
-        date_html = '''
+        # Find earliest datapoint for this section to use as min date
+        ts_col = {
+            "price_history":     ("price_history",        "timestamp"),
+            "orderbook_history": ("orderbook_history",     "captured_at"),
+            "ohlcv":             ("ohlcv",                 "date"),
+            "bond_price_history":("bond_price_history",    "timestamp"),
+            "options_contracts": ("options_contracts",     "created_ts"),
+            "bonds":             ("bonds",                 "created_ts" if False else "updated_at"),
+            "prediction_contracts":("prediction_contracts","updated_at"),
+        }.get(section)
+
+        min_date = ""
+        if ts_col:
+            table, col = ts_col
+            # Apply ticker filter to min query where relevant
+            try:
+                import aiosqlite
+                from config import settings as cfg
+                async with aiosqlite.connect(cfg.db_path) as conn:
+                    if ticker and section in {"price_history", "orderbook_history", "ohlcv"}:
+                        cur = await conn.execute(
+                            f"SELECT MIN({col}) FROM {table} WHERE ticker = ?",
+                            (ticker.upper(),)
+                        )
+                    else:
+                        cur = await conn.execute(f"SELECT MIN({col}) FROM {table}")
+                    row = await cur.fetchone()
+                    if row and row[0]:
+                        min_date = str(row[0])[:10]
+            except Exception:
+                pass
+
+        date_html = f'''
         <span class="tb-label" style="margin-left:8px">From</span>
-        <input type="date" id="dt-from" style="font-family:inherit;font-size:12px;border:1px solid #d4d4d4;border-radius:5px;padding:4px 8px;color:#374151;outline:none">
+        <input type="date" id="dt-from"
+          {"min=\"" + min_date + "\"" if min_date else ""}
+          max="{today}"
+          style="font-family:inherit;font-size:12px;border:1px solid #d4d4d4;border-radius:5px;padding:4px 8px;color:#374151;outline:none">
         <span class="tb-label">To</span>
-        <input type="date" id="dt-to" style="font-family:inherit;font-size:12px;border:1px solid #d4d4d4;border-radius:5px;padding:4px 8px;color:#374151;outline:none">
+        <input type="date" id="dt-to"
+          {"min=\"" + min_date + "\"" if min_date else ""}
+          max="{today}"
+          style="font-family:inherit;font-size:12px;border:1px solid #d4d4d4;border-radius:5px;padding:4px 8px;color:#374151;outline:none">
         '''
 
     toolbar = f'''<div id="toolbar">
@@ -464,6 +505,10 @@ async def admin_panel(
         var from = document.getElementById("dt-from");
         var to   = document.getElementById("dt-to");
         if (!from) return;
+        // Keep "to" min in sync with "from" value
+        if (from.value && to) to.min = from.value;
+        // Keep "from" max in sync with "to" value
+        if (to.value && from) from.max = to.value || "{today}";
         var base = "/admin/export/{section}?fmt=";
         var tf   = "{tf}";
         var fd   = from.value ? "&from_dt=" + from.value + "T00:00:00" : "";
