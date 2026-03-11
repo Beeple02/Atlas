@@ -39,7 +39,10 @@ FILTERABLE = {"orderbook", "orderbook_history", "price_history", "ohlcv", "share
 
 # ── Data fetcher ──────────────────────────────────────────────────────────────
 
-async def _get_data(section: str, ticker: str | None) -> list[dict]:
+async def _get_data(section: str, ticker: str | None,
+                    from_dt: str | None = None, to_dt: str | None = None,
+                    export: bool = False) -> list[dict]:
+    limit = 999_999 if export else 500
     if section == "securities":
         return await db.get_all_securities()
     elif section == "orderbook":
@@ -48,22 +51,42 @@ async def _get_data(section: str, ticker: str | None) -> list[dict]:
             return [ob] if ob else []
         return await db.get_all_orderbooks()
     elif section == "orderbook_history":
-        return await db.get_orderbook_history(ticker or None, limit=1000)
+        if from_dt or to_dt:
+            return await db._fetchall(
+                "SELECT * FROM orderbook_history WHERE ticker = ? AND captured_at BETWEEN ? AND ? ORDER BY captured_at DESC"
+                if ticker else
+                "SELECT * FROM orderbook_history WHERE captured_at BETWEEN ? AND ? ORDER BY captured_at DESC",
+                (ticker.upper(), from_dt or "1970-01-01", to_dt or "9999-12-31") if ticker
+                else (from_dt or "1970-01-01", to_dt or "9999-12-31")
+            )
+        return await db.get_orderbook_history(ticker or None, limit=limit if not export else 999_999)
     elif section == "price_history":
         if ticker:
-            return await db.get_price_history(ticker.upper(), days=365, limit=5000)
+            if from_dt or to_dt:
+                return await db.get_price_history(ticker.upper(), days=36500, limit=limit,
+                                                   from_dt=from_dt, to_dt=to_dt)
+            return await db.get_price_history(ticker.upper(), days=365, limit=limit)
         tickers = await db.get_all_tickers()
         rows = []
         for t in tickers:
-            rows.extend(await db.get_price_history(t, days=365, limit=500))
+            if from_dt or to_dt:
+                rows.extend(await db.get_price_history(t, days=36500, limit=limit,
+                                                        from_dt=from_dt, to_dt=to_dt))
+            else:
+                rows.extend(await db.get_price_history(t, days=365 if not export else 36500, limit=limit))
         return rows
     elif section == "ohlcv":
         if ticker:
-            return await db.get_ohlcv(ticker.upper(), days=365)
+            return await db.get_ohlcv(ticker.upper(), days=36500 if export else 365)
         tickers = await db.get_all_tickers()
         rows = []
         for t in tickers:
-            rows.extend(await db.get_ohlcv(t, days=365))
+            rows.extend(await db.get_ohlcv(t, days=36500 if export else 365))
+        # Apply date filter manually if needed
+        if from_dt:
+            rows = [r for r in rows if r.get("date", "") >= from_dt[:10]]
+        if to_dt:
+            rows = [r for r in rows if r.get("date", "") <= to_dt[:10]]
         return rows
     elif section == "derived":
         return await db.get_all_derived()
@@ -91,23 +114,51 @@ async def _get_data(section: str, ticker: str | None) -> list[dict]:
     elif section == "options_contracts":
         include_expired = ticker == "__all__"
         symbol_filter = ticker if ticker and ticker != "__all__" else None
-        return await db.get_all_options_contracts(active_only=not include_expired, symbol=symbol_filter)
+        rows = await db.get_all_options_contracts(active_only=not include_expired, symbol=symbol_filter)
+        if from_dt:
+            rows = [r for r in rows if (r.get("expiration_ts") or "") >= from_dt]
+        if to_dt:
+            rows = [r for r in rows if (r.get("expiration_ts") or "") <= to_dt]
+        return rows
     elif section == "bonds":
         include_matured = ticker == "__all__"
-        return await db.get_all_bonds(active_only=not include_matured)
+        rows = await db.get_all_bonds(active_only=not include_matured)
+        if from_dt:
+            rows = [r for r in rows if (r.get("maturity_date") or "") >= from_dt[:10]]
+        if to_dt:
+            rows = [r for r in rows if (r.get("maturity_date") or "") <= to_dt[:10]]
+        return rows
     elif section == "bond_price_history":
         if ticker:
             bond = await db.get_bond_by_symbol(ticker.upper())
             if bond:
-                return await db.get_bond_price_history(bond["bond_id"], days=365, limit=5000)
+                rows = await db.get_bond_price_history(bond["bond_id"], days=36500, limit=limit)
+                if from_dt:
+                    rows = [r for r in rows if (r.get("timestamp") or "") >= from_dt]
+                if to_dt:
+                    rows = [r for r in rows if (r.get("timestamp") or "") <= to_dt]
+                return rows
         import aiosqlite
         from config import settings as cfg
         async with aiosqlite.connect(cfg.db_path) as conn:
             conn.row_factory = aiosqlite.Row
-            cur = await conn.execute("SELECT * FROM bond_price_history ORDER BY timestamp DESC LIMIT 2000")
+            if from_dt or to_dt:
+                cur = await conn.execute(
+                    "SELECT * FROM bond_price_history WHERE timestamp BETWEEN ? AND ? ORDER BY timestamp DESC",
+                    (from_dt or "1970-01-01", to_dt or "9999-12-31")
+                )
+            else:
+                cur = await conn.execute(
+                    f"SELECT * FROM bond_price_history ORDER BY timestamp DESC{'  LIMIT 2000' if not export else ''}"
+                )
             return [dict(r) for r in await cur.fetchall()]
     elif section == "prediction_contracts":
-        return await db.get_all_prediction_contracts(active_only=False)
+        rows = await db.get_all_prediction_contracts(active_only=False)
+        if from_dt:
+            rows = [r for r in rows if (r.get("expiration_ts") or "") >= from_dt]
+        if to_dt:
+            rows = [r for r in rows if (r.get("expiration_ts") or "") <= to_dt]
+        return rows
     return []
 
 
@@ -146,8 +197,10 @@ async def export_data(
     section: str,
     fmt: str = Query(default="csv"),
     ticker: str | None = Query(default=None),
+    from_dt: str | None = Query(default=None),
+    to_dt: str | None = Query(default=None),
 ):
-    rows = await _get_data(section, ticker)
+    rows = await _get_data(section, ticker or None, from_dt=from_dt, to_dt=to_dt, export=True)
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     fname = f"atlas_{section}_{ts}"
     if fmt == "json":
@@ -382,16 +435,49 @@ async def admin_panel(
         filter_html = f'''<span class="tb-label">Ticker</span>
         <select onchange="location='/admin?section={section}&ticker='+this.value">{opts}</select>'''
 
+    # Date range inputs — shown for time-series sections
+    date_sections = {"price_history", "orderbook_history", "ohlcv", "bond_price_history",
+                     "options_contracts", "bonds", "prediction_contracts"}
+    date_html = ""
+    if section in date_sections:
+        date_html = '''
+        <span class="tb-label" style="margin-left:8px">From</span>
+        <input type="date" id="dt-from" style="font-family:inherit;font-size:12px;border:1px solid #d4d4d4;border-radius:5px;padding:4px 8px;color:#374151;outline:none">
+        <span class="tb-label">To</span>
+        <input type="date" id="dt-to" style="font-family:inherit;font-size:12px;border:1px solid #d4d4d4;border-radius:5px;padding:4px 8px;color:#374151;outline:none">
+        '''
+
     toolbar = f'''<div id="toolbar">
       {filter_html}
+      {date_html}
       <div class="export-group">
         <span class="lbl">Export</span>
-        <a href="/admin/export/{section}?fmt=csv{tf}" class="btn-export">CSV</a>
-        <a href="/admin/export/{section}?fmt=json{tf}" class="btn-export">JSON</a>
-        <a href="/admin/export/{section}?fmt=xlsx{tf}" class="btn-export">Excel</a>
+        <a id="exp-csv"  href="/admin/export/{section}?fmt=csv{tf}"  class="btn-export">CSV</a>
+        <a id="exp-json" href="/admin/export/{section}?fmt=json{tf}" class="btn-export">JSON</a>
+        <a id="exp-xlsx" href="/admin/export/{section}?fmt=xlsx{tf}" class="btn-export">Excel</a>
       </div>
-      <span class="row-count">{len(rows):,} rows</span>
-    </div>'''
+      <span class="row-count">{len(rows):,} rows shown</span>
+    </div>
+    <script>
+    (function(){{
+      function updateExportLinks() {{
+        var from = document.getElementById("dt-from");
+        var to   = document.getElementById("dt-to");
+        if (!from) return;
+        var base = "/admin/export/{section}?fmt=";
+        var tf   = "{tf}";
+        var fd   = from.value ? "&from_dt=" + from.value + "T00:00:00" : "";
+        var td   = to.value   ? "&to_dt="   + to.value   + "T23:59:59" : "";
+        document.getElementById("exp-csv").href  = base + "csv"  + tf + fd + td;
+        document.getElementById("exp-json").href = base + "json" + tf + fd + td;
+        document.getElementById("exp-xlsx").href = base + "xlsx" + tf + fd + td;
+      }}
+      var f = document.getElementById("dt-from");
+      var t = document.getElementById("dt-to");
+      if (f) f.addEventListener("change", updateExportLinks);
+      if (t) t.addEventListener("change", updateExportLinks);
+    }})();
+    </script>'''
 
     # Section label + table
     section_label = dict(SECTIONS).get(section, section)
