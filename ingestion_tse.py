@@ -65,8 +65,17 @@ def _hours_to_expiry(expiration_ts: str) -> Optional[float]:
 
 # ── Stocks ────────────────────────────────────────────────────────────────────
 
+def _float(v):
+    """Cast TSE string numerics to float safely."""
+    try: return float(v) if v is not None else None
+    except (ValueError, TypeError): return None
+
+
 async def poll_tse_securities() -> None:
-    """Fetch all TSE-listed stocks and upsert into securities table."""
+    """Fetch all TSE-listed stocks and upsert into securities table.
+    Enriches each security with live market data from /api/v1/market/{symbol}
+    since /api/v1/stocks does not reliably populate current_price.
+    """
     if not TSE_ENABLED:
         return
     data = await _get("/api/v1/stocks")
@@ -77,22 +86,50 @@ async def poll_tse_securities() -> None:
     securities = []
     for s in stocks:
         symbol = s.get("symbol") or s.get("ticker") or ""
+        if not symbol:
+            continue
         ticker = _prefix(symbol)
-        # TSE returns numeric fields as strings — cast safely
-        def _float(v):
-            try: return float(v) if v is not None else None
-            except (ValueError, TypeError): return None
+
+        # Enrich with live market data — /api/v1/stocks doesn't populate
+        # current_price for tickers without recent trades, but /api/v1/market/{symbol}
+        # always has lastPrice from the last known trade.
+        market = await _get(f"/api/v1/market/{symbol}") or {}
+        await asyncio.sleep(0.05)
+
+        last_price = _float(market.get("lastPrice")) or _float(s.get("current_price") or s.get("price"))
+        total_shares = s.get("total_shares") or s.get("shares_outstanding") or 0
+        market_cap = _float(market.get("marketCap")) or _float(s.get("market_cap"))
+        if market_cap is None and last_price and total_shares:
+            market_cap = last_price * total_shares
+
+        best_bid = _float(market.get("bestBid"))
+        best_ask = _float(market.get("bestAsk"))
+
         securities.append({
             "ticker": ticker,
             "full_name": s.get("company_name") or s.get("name") or s.get("full_name"),
-            "market_price": _float(s.get("current_price") or s.get("price") or s.get("last_price")),
-            "total_shares": s.get("total_shares") or s.get("shares_outstanding"),
-            "market_cap": _float(s.get("market_cap")),
+            "market_price": last_price,
+            "total_shares": total_shares,
+            "market_cap": market_cap,
             "shareholder_count": s.get("shareholder_count") or s.get("holder_count"),
             "frozen": s.get("status", "active") != "active",
             "hidden": False,
             "security_type": s.get("sector") or "stock",
         })
+
+        # Also update orderbook cache if market data has bid/ask
+        if best_bid is not None or best_ask is not None:
+            mid = ((best_bid + best_ask) / 2) if best_bid and best_ask else (best_bid or best_ask)
+            spread = _float(market.get("spread"))
+            await db.upsert_orderbook(ticker, {
+                "bids": [[best_bid, None]] if best_bid else [],
+                "asks": [[best_ask, None]] if best_ask else [],
+                "best_bid": best_bid,
+                "best_ask": best_ask,
+                "mid": mid,
+                "spread": spread,
+                "source": "tse",
+            })
 
     if securities:
         await db.upsert_securities_with_source(securities, "tse")
@@ -182,17 +219,63 @@ async def poll_tse_ohlcv(ticker_symbol: str, interval: str = "1h") -> None:
         logger.debug("TSE ohlcv %s [%s]: %d candles", symbol, interval, len(candles))
 
 
+async def poll_tse_market(ticker_symbol: str) -> None:
+    """Pull /api/v1/market/{symbol} and update market_price + orderbook cache."""
+    symbol = ticker_symbol.replace("TSE:", "")
+    market = await _get(f"/api/v1/market/{symbol}")
+    if not market:
+        return
+
+    last_price = _float(market.get("lastPrice"))
+    best_bid   = _float(market.get("bestBid"))
+    best_ask   = _float(market.get("bestAsk"))
+    spread     = _float(market.get("spread"))
+    volume     = market.get("volume")
+    ticker     = _prefix(symbol)
+
+    # Update market_price in securities table
+    if last_price is not None:
+        import aiosqlite
+        from config import settings as cfg
+        total_shares_row = await db._fetchone(
+            "SELECT total_shares FROM securities WHERE ticker = ?", (ticker,)
+        )
+        total_shares = (total_shares_row or {}).get("total_shares") or 0
+        market_cap = last_price * total_shares if total_shares else None
+        async with aiosqlite.connect(cfg.db_path) as conn:
+            await conn.execute(
+                """UPDATE securities SET market_price = ?, market_cap = ?, updated_at = ?
+                   WHERE ticker = ?""",
+                (last_price, market_cap, datetime.now(timezone.utc).isoformat(), ticker)
+            )
+            await conn.commit()
+
+    # Update orderbook cache
+    if best_bid is not None or best_ask is not None:
+        mid = ((best_bid + best_ask) / 2) if best_bid and best_ask else (best_bid or best_ask)
+        await db.upsert_orderbook(ticker, {
+            "bids": [[best_bid, None]] if best_bid else [],
+            "asks": [[best_ask, None]] if best_ask else [],
+            "best_bid": best_bid,
+            "best_ask": best_ask,
+            "mid": mid,
+            "spread": spread,
+            "source": "tse",
+        })
+
+
 async def poll_all_tse_prices() -> None:
-    """Poll prices + orderbook + ohlcv for all TSE stocks."""
+    """Poll prices + market data + orderbook for all TSE stocks."""
     if not TSE_ENABLED:
         return
     tickers = await db.get_all_tickers()
     tse_tickers = [t for t in tickers if t.startswith("TSE:")]
 
     for ticker in tse_tickers:
-        await poll_tse_prices(ticker)
-        await poll_tse_orderbook(ticker)
-        await asyncio.sleep(0.1)  # tiny stagger — 60/s limit is generous
+        await poll_tse_prices(ticker)      # trade history
+        await poll_tse_market(ticker)      # lastPrice + bid/ask → securities + orderbook cache
+        await poll_tse_orderbook(ticker)   # full depth orderbook
+        await asyncio.sleep(0.1)
 
     await db.set_meta("tse_last_price_poll", datetime.now(timezone.utc).isoformat())
     logger.info("TSE: polled prices for %d tickers", len(tse_tickers))
