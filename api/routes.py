@@ -336,10 +336,8 @@ async def analytics_ohlcv(
     await _assert_ticker_exists(ticker)
     from computation import compute_ohlcv_analytics
     candles = await db.get_ohlcv(ticker, days=days)
-    if not candles:
-        raise HTTPException(status_code=404, detail={"detail": "No OHLCV data available.", "code": "NO_DATA"})
-    analytics = compute_ohlcv_analytics(candles)
-    return {"ticker": ticker, "candles": candles, **analytics}
+    analytics = compute_ohlcv_analytics(candles) if candles else {}
+    return {"ticker": ticker, "candles": candles or [], **analytics}
 
 
 # ── Analytics: ticker deep-dive stats ────────────────────────────────────────
